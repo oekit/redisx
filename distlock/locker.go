@@ -106,8 +106,8 @@ func WithOnUnlock(fn func(key string, err error)) RedisLockerOption {
 
 // WithAutoRenew 启用自动续期。
 // 续期间隔默认为 TTL/2，可通过 WithRenewInterval 自定义。
-// 仅 Lock 成功后启动续期；TryLock 不启动（调用方可对 TryLock 场景
-// 显式调用 Lock 语义或自行处理）。
+// Lock 与 TryLock 成功后均启动续期（对称语义）：TryLock 场景的
+// 「非阻塞获取 + 持有期续期」不再需要用 Lock(timeout=0) 模拟。
 func WithAutoRenew() RedisLockerOption {
 	return func(l *RedisLocker) { l.autoRenew = true }
 }
@@ -160,8 +160,13 @@ func (l *RedisLocker) generateValue() (string, error) {
 // 返回 (ownerID, nil) 表示成功，ownerID 用于后续 Unlock。
 // 返回 ("", ErrLockNotAcquired) 表示锁被占用。
 // 返回 ("", err) 表示 Redis 错误。
+// 启用 WithAutoRenew 时，成功获取后与 Lock 对称地启动自动续期。
 func (l *RedisLocker) TryLock(ctx context.Context, key string, ttl time.Duration) (string, error) {
 	if l.client == nil && l.gracefulDegradation {
+		// graceful 模式下同样注册 lockState 保持 Lock/Unlock 状态机对称。
+		if l.autoRenew {
+			l.startAutoRenew(ctx, key, "no-redis", ttl)
+		}
 		return "no-redis", nil
 	}
 	// go-redis SetNX 的 ttl=0 表示永不过期——零值 Duration（未初始化的
@@ -194,6 +199,9 @@ func (l *RedisLocker) TryLock(ctx context.Context, key string, ttl time.Duration
 	}
 	if l.onLock != nil {
 		l.onLock(key, true, nil)
+	}
+	if l.autoRenew {
+		l.startAutoRenew(ctx, key, value, ttl)
 	}
 	return value, nil
 }
@@ -233,6 +241,31 @@ func (l *RedisLocker) Unlock(ctx context.Context, key string, ownerID string) er
 		l.onUnlock(key, err)
 	}
 	return err
+}
+
+// Renew 手动续期：原子 check-and-renew（Lua CAS，GET==ownerID → PEXPIRE），
+// 只有 ownerID 仍持有锁才续期，毫秒精度。
+// 返回 true 表示续期成功；false 表示锁已丢失/易主/过期（调用方应停止
+// 当前工作并重新获取锁，继续执行会与新的持有者并发）；error 表示 Redis
+// 通信故障（网络抖动等，可重试）。
+// 与 WithAutoRenew 的 watchdog 解耦：调用方自管续期节奏，不受
+// WithMaxAutoRenew 安全网约束。方法在具体类型 *RedisLocker 上、
+// 不进 Locker 接口（etcdx 等其他后端实现保持接口同形可互换）。
+func (l *RedisLocker) Renew(ctx context.Context, key, ownerID string, ttl time.Duration) (bool, error) {
+	if l.client == nil && l.gracefulDegradation {
+		return true, nil
+	}
+	if l.client == nil {
+		return false, fmt.Errorf("distlock: redis client is nil (construct with a client or enable WithGracefulDegradation)")
+	}
+	if ttl <= 0 {
+		return false, fmt.Errorf("distlock: ttl must be positive, got %v", ttl)
+	}
+	result, err := renewScript.Run(ctx, l.client, []string{l.lockKey(key)}, ownerID, ttl.Milliseconds()).Int()
+	if err != nil {
+		return false, fmt.Errorf("redis renew failed: %w", err)
+	}
+	return result == 1, nil
 }
 
 // Lock 带超时重试地获取分布式锁（阻塞直到成功或超时）。

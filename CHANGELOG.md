@@ -2,6 +2,28 @@
 
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
+## [v0.8.0] — 2026-10-18
+
+- feat(distlock): 新增 `Semaphore` 分布式信号量（ZSET 槽位 + slotTTL + 持有者
+  续期，#4）——`Acquire` Lua 原子「清过期槽→已持有幂等刷新→容量检查→占槽」，
+  成员集合大小任何时刻不超 max；`Renew` 仅未过期槽可续（过期槽不得复活，
+  配额可能已被他人接管），false=槽已丢失应停止工作；`Release` 幂等；
+  `Cleanup(olderThan)` 巡检清理返回条数（宽限语义）；score 为过期 Unix 毫秒
+  时间戳，持有者崩溃后槽位 slotTTL 过期自愈，多实例共享全局并发上限
+  （收编 git-ferry-core redisGuard 同款语义）；不提供无 Redis 降级——配额
+  语义降级放行即静默超限，nil client 一律报错
+- feat(distlock): `RedisLocker.Renew(ctx, key, ownerID, ttl) (bool, error)`
+  手动续期（#5）——暴露 renewScript 的 Lua CAS（GET==owner→PEXPIRE 毫秒
+  精度），调用方自管 watchdog，不受 WithMaxAutoRenew 安全网约束；
+  false=锁已丢失/易主，error=Redis 通信故障；方法落具体类型不进 Locker
+  接口（etcdx 等后端实现保持接口同形可互换）
+- feat(distlock)!: `WithAutoRenew` 覆盖 TryLock（#5）——TryLock 成功即注册
+  续期状态，与 Lock 对称；「非阻塞获取 + 持有期续期」不再需要
+  Lock(timeout=0) 模拟非阻塞的绕法；graceful 降级路径同步注册状态保持
+  Unlock 状态机对称。行为变更：此前 WithAutoRenew+TryLock 组合不续期，
+  现在会保活（未启用该选项的调用方零影响）
+- docs: distlock doc.go 补任务互斥续期与信号量场景示例
+
 ## [v0.7.6] — 2026-10-17
 
 - fix(deps): logx 地板 v0.5.0 → v0.6.0（零代码改动）
