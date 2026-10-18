@@ -1,7 +1,7 @@
 # AGENTS.md — oekit/redisx
 
 > Redis 全家——客户端封装（根包）、分布式缓存 cache/、分布式锁与信号量 distlock（TryLock/Lock 自动续期 + 手动 Renew + Semaphore）、分布式限流 ratelimit（Lua 三态 + 故障本地兜底）
-> 当前版本：`v0.8.0` · module：`github.com/oekit/redisx` · org：[oekit = Open Easy Kit](https://oekit.github.io)
+> 当前版本：`v0.9.0` · module：`github.com/oekit/redisx` · org：[oekit = Open Easy Kit](https://oekit.github.io)
 
 ## 本仓包含
 `./`、`cache/`、`distlock/`、`ratelimit/`

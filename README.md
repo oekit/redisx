@@ -11,7 +11,7 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/redisx@v0.8.0
+go get github.com/oekit/redisx@v0.9.0
 ```
 
 ## 这个仓库做什么
@@ -25,7 +25,7 @@ go get github.com/oekit/redisx@v0.8.0
 |---|---|
 | 根包 | Redis 客户端封装（`NewClientFromConfig`，原 `redisx` 子包上收） |
 | `cache` | [pkg](https://github.com/oekit/pkg) 缓存接口（`pkg/cache`）的 Redis 后端实现（原 `redis/` 子包；行为契约由 pkg 的 [cachetest](https://github.com/oekit/pkg/tree/main/cache/cachetest) 套件机器验证） |
-| `distlock` | 分布式锁（TryLock/Lock + 可选自动续期 WithAutoRenew，TryLock 与 Lock 对称；手动续期 `Renew` Lua CAS；无 Redis 优雅降级）+ 分布式信号量 `Semaphore`（ZSET 槽位 + slotTTL 过期自愈，跨实例共享并发上限，崩溃持有者槽位自动回收） |
+| `distlock` | 分布式锁（TryLock/Lock + 可选自动续期 WithAutoRenew，TryLock 与 Lock 对称；手动续期 `Renew` Lua CAS；无 Redis 优雅降级）+ 分布式信号量 `Semaphore`（ZSET 槽位 + slotTTL 过期自愈，跨实例共享并发上限，崩溃持有者槽位自动回收）+ 分布式防爆破锁 `Lockout`（v0.9.0，redisx#6：滑窗失败计数达阈值 → 锁定 Penalty 时长——**惩罚只按首次触发计算不延长**（SET PX NX）→ 成功 Reset 清零；Fail/Check(剩余时长)/Reset 全 Lua 原子，窗口 ZSET PEXPIRE 空闲消亡；与 concurrency/ratelimit.Lockout 成对——多实例共享计数防「失败打散绕过进程内锁」） |
 | `ratelimit` | 分布式限流——固定窗口 + 令牌桶（Lua 三态 + 故障本地兜底，存储抽象收 go-redis v9 的 `redis.Scripter` 接口） |
 
 ## 快速使用

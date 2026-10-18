@@ -1,6 +1,21 @@
-# Changelog — oekit/redisx
+## [v0.9.0] — 2026-10-18
 
-由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
+### feat(distlock)：分布式防爆破锁 `Lockout`（[#6](https://github.com/oekit/redisx/issues/6)——与 Semaphore 成对的共享惩罚）
+- `NewLockout(rdb, LockoutConfig{KeyPrefix, Threshold, Window, Penalty})`：
+  滑窗失败计数达阈值 → key 进入锁定拒绝态持续 Penalty → 成功 `Reset` 清零
+  （兼管理员解封）；`Fail`（返回窗口计数）/`Check`（locked + 剩余时长，供 429
+  文案）/`Reset` 全部 Lua 原子执行
+- 语义对齐 concurrency/ratelimit.Lockout（进程内孪生）：惩罚时长**只按首次触发
+  计算**（锁定标记 `SET PX NX`，锁定期间的后续失败不延长）；到期自动解除，
+  窗口内旧失败仍在时下一次 Fail 即重新锁定（重复违规者）；空闲 key 窗口
+  PEXPIRE 自然消亡
+- 多实例共享计数是本类型的存在理由：攻击者把失败尝试打散到不同实例即可绕过
+  进程内锁；典型装配 = Redis 本类型为主 + concurrency/ratelimit.Lockout 进程内
+  降级层（防爆破语义降级放行 = 静默失效，本类型不内置降级，nil client fail-fast）
+- 实现坑（测试抓出）：Redis `EXPIRE` 是秒、`PEXPIRE` 是毫秒——窗口参数按毫秒
+  传递错用 EXPIRE 会让窗口 key 长生不老、旧失败滞留导致「过期后首次失败即重锁」
+- 测试 6 例（miniredis + 注入时钟双时区：窗口判定走 Go 毫秒、标记 TTL 走
+  miniredis FastForward）：触发/到期/滑窗重算/惩罚不延长/Reset/键隔离/校验
 
 ## [v0.8.0] — 2026-10-18
 
