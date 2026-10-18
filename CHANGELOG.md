@@ -52,11 +52,6 @@
   SA4000（两次 Allow 有副作用但表达式字面相同，拆变量规避误报）
 - deps: github.com/oekit/pkg v0.4.0 → v0.6.0（BatchGetter 接口）
 
-## [v0.6.0] — 2026-10-16（补录）
-
-- feat(cache)!: 缓存接口引用迁移 pkg/cache——data 转门面前置手术
-  （接口住 pkg 下游，Redis 后端依赖接口）
-
 ## [v0.6.1] — 2026-10-16
 
 - fix(ratelimit): 探活应答形态校验——`probe()` 此前只检查 `Err()==nil`，探活脚本应答形态
@@ -64,6 +59,11 @@
   应答为整数 1（probeLua 常量），否则保持兜底等待下一次探测。消除 TokenLimiter 兜底
   回切与后台探活 goroutine 的竞态闪烁
   （`TestTokenLimiter_UnknownResponse_FallbackEngages` 修复前 5 跑 1 挂）
+
+## [v0.6.0] — 2026-10-16（补录）
+
+- feat(cache)!: 缓存接口引用迁移 pkg/cache——data 转门面前置手术
+  （接口住 pkg 下游，Redis 后端依赖接口）
 
 ## [v0.5.1] — 2026-10-17
 
