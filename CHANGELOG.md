@@ -1,3 +1,7 @@
+## [v0.9.1] — 2026-10-19
+
+- build: 矩阵内依赖地板对齐（align_floors 不动点）：concurrency v0.5.4 → v0.17.0、logx v0.6.0 → v0.7.0、pkg v0.11.0 → v0.15.1
+
 ## [v0.9.0] — 2026-10-18
 
 ### feat(distlock)：分布式防爆破锁 `Lockout`（[#6](https://github.com/oekit/redisx/issues/6)——与 Semaphore 成对的共享惩罚）
@@ -16,10 +20,6 @@
   传递错用 EXPIRE 会让窗口 key 长生不老、旧失败滞留导致「过期后首次失败即重锁」
 - 测试 6 例（miniredis + 注入时钟双时区：窗口判定走 Go 毫秒、标记 TTL 走
   miniredis FastForward）：触发/到期/滑窗重算/惩罚不延长/Reset/键隔离/校验
-
-## [v0.9.1] — 2026-10-19
-
-- build: 矩阵内依赖地板对齐（align_floors 不动点）：concurrency v0.5.4 → v0.17.0、logx v0.6.0 → v0.7.0、pkg v0.11.0 → v0.15.1
 
 ## [v0.8.0] — 2026-10-18
 
