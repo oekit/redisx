@@ -1,3 +1,7 @@
+## [v0.9.1] — 2026-10-19
+
+- build: 矩阵内依赖地板对齐（align_floors 不动点）：concurrency v0.5.4 → v0.17.0、logx v0.6.0 → v0.7.0、pkg v0.11.0 → v0.15.1
+
 ## [v0.9.0] — 2026-10-18
 
 ### feat(distlock)：分布式防爆破锁 `Lockout`（[#6](https://github.com/oekit/redisx/issues/6)——与 Semaphore 成对的共享惩罚）
