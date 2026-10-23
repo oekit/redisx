@@ -1,3 +1,7 @@
+## [v0.10.2] — 2026-10-23
+
+- fix(distlock): Lock() 不再重复启动自动续期 goroutine——同一把锁只启一次续期，Unlock 后不再残留孤儿 goroutine，也不再打出误导性的「锁丢了」WARN（#33）
+
 ## [v0.10.1] — 2026-10-23
 
 - docs: 更正旧模块路径的可拉取范围（≤ v0.4.0，不是 v0.3.1）与更名版本号（v0.5.0，不是 v0.4.0）——仍在旧路径 github.com/oekit/redis 的消费方请显式 pin v0.4.0 或迁到 github.com/oekit/redisx；不要依赖 go get github.com/oekit/redis@latest（proxy 的 @latest 指向 v0.10.0，会撞 module path 校验失败）（#31）
