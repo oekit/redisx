@@ -270,7 +270,8 @@ func (l *RedisLocker) Renew(ctx context.Context, key, ownerID string, ttl time.D
 
 // Lock 带超时重试地获取分布式锁（阻塞直到成功或超时）。
 // 重试间隔由 WithRetryInterval 配置（默认 100ms）。
-// 如果启用了自动续期，成功获取锁后会启动续期 goroutine。
+// 如果启用了自动续期，成功获取锁后会启动续期 goroutine
+// （由 TryLock 统一负责，避免同一把锁重复启动续期，#33）。
 // 返回 (ownerID, nil) 表示成功。
 // 返回 ("", ErrLockTimeout) 表示超时未获取到。
 func (l *RedisLocker) Lock(ctx context.Context, key string, ttl time.Duration, timeout time.Duration) (string, error) {
@@ -290,9 +291,11 @@ func (l *RedisLocker) Lock(ctx context.Context, key string, ttl time.Duration, t
 	for {
 		ownerID, err := l.TryLock(ctx, key, ttl)
 		if err == nil {
-			if l.autoRenew {
-				l.startAutoRenew(ctx, key, ownerID, ttl)
-			}
+			// TryLock 成功时已按「成功即续期」的语义启动自动续期（见 TryLock），
+			// 此处不得重复启动：重复启动会用新 state 覆盖旧 state，使先启动的
+			// 续期 goroutine 成为孤儿 —— Unlock 的 LoadAndDelete 只停得到后启动
+			// 的那个，孤儿要到下一个 tick 才发现锁已不属于自己，并打出误导性的
+			// "auto renew failed: lock lost or not owned"（#33）。
 			return ownerID, nil
 		}
 		if !errors.Is(err, ErrLockNotAcquired) {
@@ -321,7 +324,20 @@ func (l *RedisLocker) Lock(ctx context.Context, key string, ttl time.Duration, t
 func (l *RedisLocker) startAutoRenew(_ context.Context, key string, ownerID string, ttl time.Duration) {
 	renewCtx, cancel := context.WithCancel(context.Background())
 	st := &lockState{ownerID: ownerID, stopChan: make(chan struct{}), cancel: cancel}
-	l.locks.Store(key, st)
+	// 覆盖旧 state 前先停掉它（防御性，#33）：同一 key 的旧 state 若仍在续期，
+	// 它的 goroutine 只能等下一个 tick 才发现锁已不属于自己 —— 既泄漏 goroutine，
+	// 又打出误导性的 "auto renew failed: lock lost or not owned"。新获取锁成功
+	// （SetNX 通过）意味着旧持有者的锁已不存在，停掉旧续期是安全的。
+	if old, ok := l.locks.Swap(key, st); ok {
+		if prev, ok := old.(*lockState); ok {
+			prev.once.Do(func() {
+				if prev.cancel != nil {
+					prev.cancel()
+				}
+				close(prev.stopChan)
+			})
+		}
+	}
 
 	// graceful 降级模式没有真锁，也无从续期；只注册状态保持
 	// Lock/Unlock 状态机对称，不启动 goroutine（否则每 tick nil client panic）。
