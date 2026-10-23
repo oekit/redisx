@@ -1,3 +1,7 @@
+## [v0.10.3] — 2026-10-24
+
+- fix(distlock): WithMaxAutoRenew 安全网不再形同虚设——计时器改在续期 goroutine 内创建与停止，最大生命周期到期即放弃续期、锁在 TTL 后自然过期；此前 defer 绑定在 startAutoRenew 作用域，函数返回瞬间计时器即被 Stop，安全网从未触发、锁被无限续期（#39）
+
 ## [v0.10.2] — 2026-10-23
 
 - fix(distlock): Lock() 不再重复启动自动续期 goroutine——同一把锁只启一次续期，Unlock 后不再残留孤儿 goroutine，也不再打出误导性的「锁丢了」WARN（#33）
