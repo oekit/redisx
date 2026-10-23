@@ -1,3 +1,7 @@
+## [v0.10.1] — 2026-10-23
+
+- docs: 更正旧模块路径的可拉取范围（≤ v0.4.0，不是 v0.3.1）与更名版本号（v0.5.0，不是 v0.4.0）——仍在旧路径 github.com/oekit/redis 的消费方请显式 pin v0.4.0 或迁到 github.com/oekit/redisx；不要依赖 go get github.com/oekit/redis@latest（proxy 的 @latest 指向 v0.10.0，会撞 module path 校验失败）（#31）
+
 ## [v0.10.0] — 2026-10-22
 
 - Go 最低版本地板 1.24.0 → 1.26.0：依赖地板随上游上移（go-redis v9.23.0 / x/time v0.16.0 / x/sys v0.48.0 均要求 go>=1.26），CI 的 go-version 同步跟到 1.26 以满足「成对」判据（#25）
