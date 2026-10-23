@@ -1,3 +1,7 @@
+## [v0.10.4] — 2026-10-24
+
+- fix(bloom): BloomFilter 测试状态泄漏——固定 key 复跑必红，改唯一 key + 用完即删；NewBloomFilter godoc 补齐「key 已存在时复用既有过滤器」语义（#41）
+
 ## [v0.10.3] — 2026-10-24
 
 - fix(distlock): WithMaxAutoRenew 安全网不再形同虚设——计时器改在续期 goroutine 内创建与停止，最大生命周期到期即放弃续期、锁在 TTL 后自然过期；此前 defer 绑定在 startAutoRenew 作用域，函数返回瞬间计时器即被 Stop，安全网从未触发、锁被无限续期（#39）
