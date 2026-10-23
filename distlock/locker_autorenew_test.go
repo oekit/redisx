@@ -30,22 +30,32 @@ func TestStartAutoRenew_MaxLifetimeUnlimited(t *testing.T) {
 	}
 }
 
-// TestAutoRenew_MaxLifetimeExpiry 回归测试（M3）：忘记 Unlock 时，续期
-// goroutine 必须在最大生命周期后退出，锁在 TTL 后自然过期 ——
+// TestAutoRenew_MaxLifetimeExpiry 回归测试（M3，#39 补强）：忘记 Unlock 时，
+// 续期 goroutine 必须在最大生命周期后退出，锁在 TTL 后自然过期 ——
 // 此前 context.Background() 无限续期 = 永久锁 + goroutine 泄漏。
+//
+// #39 补强说明：本用例此前用 miniredis 的 FastForward 推进时钟，而 FastForward
+// 会直接删掉过期 key ⇒ 续期 goroutine 随后因 key 不存在而退出 ⇒
+// 「安全网是死代码」的实现同样能通过本用例（假绿）。
+// 改用 ClockTTL（TTL 随真实时钟递减）且不做 FastForward：
+// 修复前续期一直把 TTL 刷新回满值 ⇒ key 永远存活 ⇒ 用例红；
+// 修复后续期在 maxAutoRenew 处停止 ⇒ TTL 自然耗尽 ⇒ key 过期 ⇒ 用例绿。
 func TestAutoRenew_MaxLifetimeExpiry(t *testing.T) {
 	mr := miniredis.RunT(t)
+	mr.ClockTTL(true) // TTL 随真实时钟递减（不再依赖 FastForward 删 key）
 	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	defer c.Close()
 
 	l := NewRedisLocker(c,
 		WithAutoRenew(),
-		WithRenewInterval(20*time.Millisecond),
-		WithMaxAutoRenew(150*time.Millisecond), // 远小于后续等待
+		WithRenewInterval(50*time.Millisecond),
+		// 220ms 刻意不是续期间隔的整数倍：计时器到期时刻落在两个 tick 之间，
+		// 避免 select 在「tick 与寿命计时器同时就绪」时随机取到 tick 而多续一次。
+		WithMaxAutoRenew(220*time.Millisecond),
 	)
 	ctx := context.Background()
 
-	ownerID, err := l.Lock(ctx, "m3-key", time.Second, time.Second)
+	ownerID, err := l.Lock(ctx, "m3-key", 300*time.Millisecond, time.Second)
 	if err != nil {
 		t.Fatalf("Lock: %v", err)
 	}
@@ -53,13 +63,9 @@ func TestAutoRenew_MaxLifetimeExpiry(t *testing.T) {
 		t.Fatal("expected lock key to exist")
 	}
 
-	// 越过最大生命周期（150ms）后再等一会儿，让最后一次续期与 goroutine 退出完成
-	time.Sleep(400 * time.Millisecond)
-
-	// 此刻续期必须已停止：快进 miniredis 时钟越过剩余 TTL，key 应过期。
-	// （若无 max lifetime，续期 goroutine 会以 20ms 间隔持续 pexpire，
-	// key 永不过期。）
-	mr.FastForward(3 * time.Second)
+	// 越过最大生命周期（220ms）+ 一个 TTL（300ms）后，锁必须已过期：
+	// 续期停止 ⇒ TTL 自然耗尽 ⇒ key 被回收。
+	time.Sleep(900 * time.Millisecond)
 	if mr.Exists("lock:m3-key") {
 		t.Error("expected lock to expire after max auto-renew lifetime (renewal must stop)")
 	}
@@ -67,6 +73,42 @@ func TestAutoRenew_MaxLifetimeExpiry(t *testing.T) {
 	// 后续 Unlock 仍应安全（状态可清理，Lua 返回 0 不误删他人锁）
 	if uerr := l.Unlock(ctx, "m3-key", ownerID); uerr != nil {
 		t.Errorf("Unlock after expiry: %v", uerr)
+	}
+}
+
+// TestAutoRenew_MaxLifetimeStopsRenewal 回归测试（#39）：安全网到期后，
+// 续期 goroutine 必须真正退出 —— 不再向 Redis 发起续期命令。
+//
+// 这条断言直接盯「goroutine 是否还活着」，与「key 是否过期」正交：
+// 修复前计时器在 startAutoRenew 返回瞬间就被 defer Stop ⇒ 安全网永不触发 ⇒
+// 续期命令持续发出 ⇒ 本用例红。
+func TestAutoRenew_MaxLifetimeStopsRenewal(t *testing.T) {
+	mr := miniredis.RunT(t)
+	mr.ClockTTL(true)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer c.Close()
+
+	l := NewRedisLocker(c,
+		WithAutoRenew(),
+		WithRenewInterval(50*time.Millisecond),
+		WithMaxAutoRenew(220*time.Millisecond),
+	)
+	ctx := context.Background()
+
+	if _, err := l.Lock(ctx, "renew-stop-key", time.Second, time.Second); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+
+	// 等安全网到期（220ms）并留出余量，让续期 goroutine 走完退出分支。
+	time.Sleep(500 * time.Millisecond)
+	before := mr.CommandCount()
+
+	// 观察窗口覆盖多个续期间隔：若 goroutine 仍在续期，命令数必然增长。
+	time.Sleep(300 * time.Millisecond)
+	after := mr.CommandCount()
+
+	if after != before {
+		t.Errorf("auto renew goroutine still running after max lifetime: commands %d -> %d", before, after)
 	}
 }
 
