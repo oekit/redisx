@@ -2,6 +2,7 @@ package redisx
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -159,7 +160,15 @@ func TestBloomFilter_AddExists(t *testing.T) {
 	defer client.Close()
 
 	ctx := context.Background()
-	bf, err := client.NewBloomFilter(ctx, "bloom:test", 0.01, 1000)
+	// 每次运行用唯一 key（redisx#41）：BF.ADD 的语义是「本次新添加」还是
+	// 「元素已在过滤器中」——固定 key 时本用例断言的是前者，前置状态由上一
+	// 次运行残留 ⇒ 第二次跑 Add 必返 false，断言必红（复跑即假红）。
+	// 唯一 key 让本用例不依赖任何前置状态。
+	key := fmt.Sprintf("bloom:test:%d", time.Now().UnixNano())
+	// 用完即删——不在共享 Redis 上留残骸（与同文件 counter 用例的清理口径一致）。
+	defer func() { _ = client.Del(ctx, key).Err() }()
+
+	bf, err := client.NewBloomFilter(ctx, key, 0.01, 1000)
 	if err != nil {
 		t.Skip("RedisBloom not available, skipping test")
 	}
@@ -198,5 +207,50 @@ func TestBloomFilter_AddExists(t *testing.T) {
 	}
 	if exists {
 		t.Error("expected nonexistent to not exist")
+	}
+}
+
+// TestBloomFilter_ReuseExistingKey 锁定「key 已存在时复用既有过滤器」语义
+// （redisx#41 附带建议）：BF.RESERVE 对已存在的 key 不覆盖，故第二次
+// NewBloomFilter 传入不同的 errorRate/capacity 不报错、也不重建——调用方
+// 拿到的是与既有实例参数不符的过滤器。该语义已写入 bloom.go 的 godoc，
+// 此处断言它不会在后续改动中悄悄变成别的行为。
+func TestBloomFilter_ReuseExistingKey(t *testing.T) {
+	client := skipIfNoRedis(t)
+	defer client.Close()
+
+	ctx := context.Background()
+	key := fmt.Sprintf("bloom:reuse:%d", time.Now().UnixNano())
+	defer func() { _ = client.Del(ctx, key).Err() }()
+
+	bf, err := client.NewBloomFilter(ctx, key, 0.01, 1000)
+	if err != nil {
+		t.Skip("RedisBloom not available, skipping test")
+	}
+
+	// 同 key 再建一次：参数不同（errorRate/capacity）也**不报错**——
+	// 既有过滤器被复用，本次参数不生效。
+	bf2, err := client.NewBloomFilter(ctx, key, 0.001, 10)
+	if err != nil {
+		t.Fatalf("reuse existing key should not error, got: %v", err)
+	}
+	if bf2 == nil {
+		t.Fatal("expected non-nil bloom filter on reuse")
+	}
+
+	// 复用语义下：第一个过滤器加的元素，第二个过滤器同样可见（同一底层 key）。
+	added, err := bf.Add(ctx, "shared")
+	if err != nil {
+		t.Fatalf("Add failed: %v", err)
+	}
+	if !added {
+		t.Error("expected shared to be added")
+	}
+	exists, err := bf2.Exists(ctx, "shared")
+	if err != nil {
+		t.Fatalf("Exists failed: %v", err)
+	}
+	if !exists {
+		t.Error("expected reused filter to see element added via first handle")
 	}
 }
