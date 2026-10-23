@@ -104,7 +104,15 @@
   `import "github.com/oekit/redisx"`）；原 `redis/` 子包更名 `cache/`（package cache，
   `redis.RedisCache` → `cache.RedisCache`）；distlock/ratelimit 路径随之变为
   `github.com/oekit/redisx/distlock`、`github.com/oekit/redisx/ratelimit`
-- 旧路径 `github.com/oekit/redis` 经 GitHub 重定向可拉取 ≤ v0.3.1（v0.3.1 为旧路径最后版本）
+- 旧路径 `github.com/oekit/redis` 的可拉取范围 **≤ v0.4.0**——实测 v0.4.0 的
+  `go.mod` 仍声明 `module github.com/oekit/redis`（更名自 **v0.5.0** 起才生效），
+  `go get github.com/oekit/redis@v0.4.0` 可安装可编译；**v0.3.1 不是旧路径的
+  最后版本**（它只是「挂弃用通告」的那一版，发布时刻还晚于 v0.4.0 3 分钟）。
+  ⚠️ **不要依赖 `go get github.com/oekit/redis@latest`**：Go module proxy 一旦
+  缓存了路径，`@latest` 按该路径下最高版本解析 ⇒ 解析到 **v0.10.0**，而它的
+  `go.mod` 已是 `github.com/oekit/redisx` ⇒ 直接撞路径不匹配报错：
+  `module declares its path as: github.com/oekit/redisx but was required as: github.com/oekit/redis`
+  （2026-10-23 实测，见 [oekit/redisx#31](https://github.com/oekit/redisx/issues/31)）
 - 迁移：import 路径机械替换 `github.com/oekit/redis/redisx` → `github.com/oekit/redisx`、
   `github.com/oekit/redis/redis` → `github.com/oekit/redisx/cache`、
   `github.com/oekit/redis/distlock|ratelimit` → `github.com/oekit/redisx/distlock|ratelimit`
@@ -147,8 +155,14 @@ RedisCache 后端契约化：接口断言 + cachetest 契约套件接入 + null 
 
 ## [v0.3.1] — 2026-10-16
 
-- ⚠️ 旧路径最后版本：模块已更名为 github.com/oekit/redisx（v0.4.0 起使用新路径）；
+- ⚠️ 旧路径弃用通告版：模块已更名为 github.com/oekit/redisx（**更名自 v0.5.0
+  起生效**——本版本与 v0.4.0 的 `go.mod` 仍声明旧路径 `github.com/oekit/redis`）；
   本版本代码与 v0.3.0 完全一致，仅 README 挂弃用通告
+  > 本版本的 tag 发布于 **2026-10-16 10:20:14**，**晚于**同属旧路径线的 `v0.4.0`
+  > （10:17:14）3 分钟——旧路径线内版本号回退。**旧路径的最后一个可安装版本是
+  > `v0.4.0`**，不是本版本。事实与处置见
+  > [oekit/redisx#31](https://github.com/oekit/redisx/issues/31)；跨仓门禁口径见
+  > [oekit/matrix-tools#88](https://github.com/oekit/matrix-tools/issues/88)。
 
 ## [v0.3.0] — 2026-10-16
 
