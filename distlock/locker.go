@@ -361,19 +361,24 @@ func (l *RedisLocker) startAutoRenew(_ context.Context, key string, ownerID stri
 	case maxLifetime < 0:
 		maxLifetime = 0
 	}
-	var lifetimeTimer *time.Timer
-	var lifetimeC <-chan time.Time
-	if maxLifetime > 0 {
-		lifetimeTimer = time.NewTimer(maxLifetime)
-		defer lifetimeTimer.Stop()
-		lifetimeC = lifetimeTimer.C
-	}
-
 	stopChan := st.stopChan
 
 	async.GoSafe(func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+
+		// 计时器必须在 goroutine 内部创建并停止（#39）：defer 是函数级的，
+		// 放在 startAutoRenew 里会在函数返回的瞬间就 Stop 掉计时器 ——
+		// 派发完 goroutine 后本函数立刻返回 ⇒ lifetimeC 永不就绪 ⇒
+		// 下面 `case <-lifetimeC` 是死代码 ⇒ WithMaxAutoRenew 安全网
+		// （默认 10×ttl）从未生效，锁被无限续期。
+		var lifetimeTimer *time.Timer
+		var lifetimeC <-chan time.Time
+		if maxLifetime > 0 {
+			lifetimeTimer = time.NewTimer(maxLifetime)
+			defer lifetimeTimer.Stop()
+			lifetimeC = lifetimeTimer.C
+		}
 
 		for {
 			select {
