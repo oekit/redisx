@@ -68,6 +68,28 @@ func NewClient(opt *redis.UniversalOptions, opts ...RedisClientOptionFunc) (*Cli
 	}, nil
 }
 
+// NewClientFromClient **包住既有** go-redis 客户端，不新建连接、不改连接参数。
+//
+// 为什么需要：消费方（pigeonbox/core）自己管连接池与超时（不想让 redisx 改写
+// 它们的连接语义），但又想用 redisx 的原语（典型是 Counter.IncrWithTTL：
+// 「计数 + 首次命中才设 TTL」的原子版）。
+// 与 NewClient 的关键区别：
+//   - NewClient 会**改写**调用方未设置的连接默认参数（DialTimeout/ReadTimeout/
+//     WriteTimeout/PoolTimeout/MinIdleConns）⇒ 连接语义会变；
+//   - NewClientFromClient 一个参数都不动 ⇒ 纯包装，调用方的连接行为完全不变。
+//
+// 传入 nil 会得到一个不可用的 Client（调用其方法会 panic）——调用方应自行保证非 nil。
+func NewClientFromClient(c redis.UniversalClient, opts ...RedisClientOptionFunc) *Client {
+	o := &RedisClientOption{}
+	for _, fn := range opts {
+		fn(o)
+	}
+	return &Client{
+		prefix: o.Prefix,
+		client: c,
+	}
+}
+
 // NewClientFromAddr 从地址字符串创建 Redis 客户端（便捷方法）。
 func NewClientFromAddr(addr, password string, db int, opts ...RedisClientOptionFunc) (*Client, error) {
 	opt := &redis.UniversalOptions{

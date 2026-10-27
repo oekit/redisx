@@ -222,7 +222,20 @@ func TestTokenLimiter_Fallback_Engage(t *testing.T) {
 		t.Fatal("expected at least one redis script attempt")
 	}
 
-	// 后续：redisAlive 已翻转，判定直接走本地桶，不再触碰 Redis
+	// 后续：redisAlive 已翻转，判定直接走本地桶，不再触碰 Redis。
+	//
+	// ⚠️ 翻转由 **ping ticker** 驱动（WithTokenPingInterval）⇒ 断言「不再触碰
+	// Redis」之前必须**等它真的翻转**。此前直接断言 ⇒ CI 慢机上 ticker 还没跑到
+	// 就进了循环 ⇒ 下一次 Allow 仍探了一次 Redis ⇒ 计数 +1 ⇒ 偶发红
+	// （2026-10-27 CI 实录：calls 1 -> 2）。与姊妹用例 Fallback_Recover 同款
+	// 有界等待写法。
+	deadline := time.Now().Add(2 * time.Second)
+	for l.redisAlive.Load() && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if l.redisAlive.Load() {
+		t.Fatal("expected redisAlive=false while redis is down")
+	}
 	for i := 0; i < 5; i++ {
 		if !l.Allow(ctx) {
 			t.Fatalf("allow %d: expected local fallback to allow", i+1)
@@ -230,9 +243,6 @@ func TestTokenLimiter_Fallback_Engage(t *testing.T) {
 	}
 	if got := flaky.calls(); got != callsAfterFirst {
 		t.Fatalf("expected no redis traffic while in fallback, calls %d -> %d", callsAfterFirst, got)
-	}
-	if l.redisAlive.Load() {
-		t.Fatal("expected redisAlive=false while redis is down")
 	}
 }
 
