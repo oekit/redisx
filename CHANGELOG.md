@@ -1,3 +1,7 @@
+## [v0.10.5] — 2026-10-27
+
+- feat(client): 加 NewClientFromClient——包住既有 go-redis 客户端（纯包装：不新建连接、不改连接参数），供自己管连接池却想用 redisx 原语（Counter.IncrWithTTL 等）的消费方；另修 ratelimit 的 TokenLimiter_Fallback_Engage 时序竞态（CI 慢机上偶发红）
+
 ## [v0.10.4] — 2026-10-24
 
 - fix(bloom): BloomFilter 测试状态泄漏——固定 key 复跑必红，改唯一 key + 用完即删；NewBloomFilter godoc 补齐「key 已存在时复用既有过滤器」语义（#41）
