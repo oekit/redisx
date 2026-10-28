@@ -33,8 +33,16 @@ var unlockScript = redis.NewScript(`
 // renewScript Lua 续期脚本（原子 check-and-renew）。
 // 用 PEXPIRE 毫秒精度：SETEX秒级精度对 sub-second TTL 会截断为 0，
 // EXPIRE 0 在 Redis 里等价于立即删除。
+//
+// **脚本自身也兜住「删锁」**（2026-10-28，#54）：即便调用方传入 ≤ 0 的
+// 毫秒值，脚本也只返回 0（续期失败），**绝不执行 PEXPIRE 0** ⇒
+// 「锁被删掉却报告续期成功」这种事不可能再发生。
 var renewScript = redis.NewScript(`
 	if redis.call('get', KEYS[1]) == ARGV[1] then
+		local ms = tonumber(ARGV[2])
+		if not ms or ms <= 0 then
+			return 0
+		end
 		return redis.call('pexpire', KEYS[1], ARGV[2])
 	else
 		return 0
@@ -279,11 +287,29 @@ func (l *RedisLocker) Renew(ctx context.Context, key, ownerID string, ttl time.D
 	if ttl <= 0 {
 		return false, fmt.Errorf("distlock: ttl must be positive, got %v", ttl)
 	}
-	result, err := renewScript.Run(ctx, l.client, []string{l.lockKey(key)}, ownerID, ttl.Milliseconds()).Int()
+	result, err := renewScript.Run(ctx, l.client, []string{l.lockKey(key)}, ownerID, ttlMillis(ttl)).Int()
 	if err != nil {
 		return false, fmt.Errorf("redis renew failed: %w", err)
 	}
 	return result == 1, nil
+}
+
+// ttlMillis 把 TTL 量化成 Redis PEXPIRE 用的毫秒值，**下限 1ms**。
+//
+// 为什么要有下限（#54）：`PEXPIRE key 0` 在 Redis 语义里等于**立即删除该键**
+// ⇒ 亚毫秒 TTL（`ttl.Milliseconds() == 0`）会让续期把锁**删掉**，而调用方
+// 拿到的是「续期成功」⇒ 随后在「自己并不持有锁」的状态下写临界区 ⇒
+// 另一实例可同时 SetNX 成功 ⇒ 静默脑裂。
+//
+// 量化下限与**写路径**一致：go-redis 的 formatMs 把亚毫秒的
+// `SET NX PX` 抬到 1ms ⇒ 同一次加锁/续期的 TTL 语义一致
+// （不会出现「写 1ms、续期 0ms」这种自相矛盾）。
+func ttlMillis(ttl time.Duration) int64 {
+	ms := ttl.Milliseconds()
+	if ms < 1 {
+		return 1
+	}
+	return ms
 }
 
 // Lock 带超时重试地获取分布式锁（阻塞直到成功或超时）。
@@ -372,6 +398,12 @@ func (l *RedisLocker) startAutoRenew(_ context.Context, key string, ownerID stri
 	interval := l.renewInterval
 	if interval <= 0 {
 		interval = ttl / 2
+		if interval < time.Millisecond {
+			// 亚毫秒 TTL：续期量化的下限是 1ms（ttlMillis）⇒ 间隔也取
+			// 1ms 下限，否则会起一个 250µs 的高频 ticker 空转。
+			// 只在**由 ttl 推导**时收紧；显式 WithRenewInterval 不动。
+			interval = time.Millisecond
+		}
 	}
 	if interval <= 0 {
 		interval = 1 * time.Second
@@ -416,7 +448,7 @@ func (l *RedisLocker) startAutoRenew(_ context.Context, key string, ownerID stri
 				log.Warn("auto renew exceeded max lifetime, giving up lock", "key", key, "max_lifetime", maxLifetime)
 				return
 			case <-ticker.C:
-				result, err := renewScript.Run(renewCtx, l.client, []string{l.lockKey(key)}, ownerID, ttl.Milliseconds()).Int()
+				result, err := renewScript.Run(renewCtx, l.client, []string{l.lockKey(key)}, ownerID, ttlMillis(ttl)).Int()
 				if err != nil {
 					// 瞬时错误（网络抖动、failover）不放弃：下一个 tick 重试。
 					// 续期 goroutine 一旦退出，锁将在 TTL 后静默失效。
