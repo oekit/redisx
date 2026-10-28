@@ -1,3 +1,8 @@
+## [v0.10.6] — 2026-10-28
+
+- fix(distlock): `WithRetryInterval(0/负值)` 被无条件写入 ⇒ `Lock()` 里的 `time.NewTicker` 直接 panic（"non-positive interval for NewTicker"）——一个选项参数把进程带崩。修法：选项忽略非正值（保留默认 100ms），`Lock()` 再兜一层
+- fix(distlock): `Unlock` 缺 nil client 的 fail-fast 检查（`TryLock`/`Renew` 都有）⇒ `unlockScript.Run` 在 nil interface 上调用 ⇒ 运行时 nil 指针 panic
+
 ## [v0.10.5] — 2026-10-27
 
 - feat(client): 加 NewClientFromClient——包住既有 go-redis 客户端（纯包装：不新建连接、不改连接参数），供自己管连接池却想用 redisx 原语（Counter.IncrWithTTL 等）的消费方；另修 ratelimit 的 TokenLimiter_Fallback_Engage 时序竞态（CI 慢机上偶发红）
