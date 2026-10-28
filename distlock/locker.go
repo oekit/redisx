@@ -87,8 +87,17 @@ func WithGracefulDegradation() RedisLockerOption {
 }
 
 // WithRetryInterval 设置 Lock() 重试间隔，默认 100ms。
+//
+// **非正值被忽略**（保留默认 100ms）：time.NewTicker 对非正间隔会直接
+// panic（"non-positive interval for NewTicker"），而这里是选项函数、
+// 没有返回值可报错 ⇒ 传 0/负值不该把进程带崩。
 func WithRetryInterval(d time.Duration) RedisLockerOption {
-	return func(l *RedisLocker) { l.retryInterval = d }
+	return func(l *RedisLocker) {
+		if d <= 0 {
+			return
+		}
+		l.retryInterval = d
+	}
 }
 
 // WithOnLock 设置加锁事件回调。
@@ -130,13 +139,16 @@ func WithMaxAutoRenew(d time.Duration) RedisLockerOption {
 	return func(l *RedisLocker) { l.maxAutoRenew = d }
 }
 
+// defaultRetryInterval 是 Lock() 的默认重试间隔。
+const defaultRetryInterval = 100 * time.Millisecond
+
 // NewRedisLocker 创建基于 Redis 的分布式锁实例。
 // client 为 nil 且启用了 WithGracefulDegradation 时，所有操作直接成功。
 func NewRedisLocker(client redis.UniversalClient, opts ...RedisLockerOption) *RedisLocker {
 	l := &RedisLocker{
 		client:        client,
 		prefix:        "lock",
-		retryInterval: 100 * time.Millisecond,
+		retryInterval: defaultRetryInterval,
 	}
 	for _, opt := range opts {
 		opt(l)
@@ -235,6 +247,12 @@ func (l *RedisLocker) Unlock(ctx context.Context, key string, ownerID string) er
 	if l.client == nil && l.gracefulDegradation {
 		return nil
 	}
+	// 非法组合 fail-fast：nil client 且未开优雅降级时，缺这一检查会让
+	// unlockScript.Run 在 nil interface 上调用 ⇒ 运行时 nil 指针 panic
+	// （TryLock/Renew 都有对称检查，Unlock 此前漏了）。
+	if l.client == nil {
+		return fmt.Errorf("distlock: redis client is nil (construct with a client or enable WithGracefulDegradation)")
+	}
 
 	_, err := unlockScript.Run(ctx, l.client, []string{l.lockKey(key)}, ownerID).Result()
 	if l.onUnlock != nil {
@@ -285,7 +303,13 @@ func (l *RedisLocker) Lock(ctx context.Context, key string, ttl time.Duration, t
 	}
 
 	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(l.retryInterval)
+	// 兜底：非正间隔会让 time.NewTicker 直接 panic。WithRetryInterval 已
+	// 过滤非正值，这里再兜一层（结构体字段可被同包代码直接改写）。
+	interval := l.retryInterval
+	if interval <= 0 {
+		interval = defaultRetryInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
