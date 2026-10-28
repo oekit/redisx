@@ -1,3 +1,17 @@
+## [v0.10.7] — 2026-10-28
+
+- fix(distlock): 续期的亚毫秒 TTL 不得删锁——PEXPIRE 0 在 Redis 里等价于立即删除
+
+`Renew` 把 TTL 量化为毫秒（`ttl.Milliseconds()`），而 **0 < ttl < 1ms 时量化结果是 0** ⇒ Redis 收到 `PEXPIRE key 0` ⇒ 按 Redis 语义**直接删除该键**并回复 1 ⇒ Go 侧返回 `(true, nil)`。
+
+⇒ **锁已经被删掉，但调用方被告知「续期成功」**（自动续期 watchdog 走同一条路径 ⇒ 同一个洞）。
+
+后果形态最坏：调用方拿到 `(true, nil)` 后继续在「自己并不持有锁」的状态下写临界区 ⇒ 另一实例可同时 `SetNX` 成功 ⇒ **两个实例并发写同一资源**（静默脑裂）。配 `WithAutoRenew()` 时更短命：`interval = ttl/2 = 250µs`，取锁后 250µs 内第一次 tick 就把锁删掉，而 watchdog 要到下一拍才发现「lock lost」⇒ 炸法是跨实例重复执行同一业务动作，日志里只有一条 `auto renew failed: lock lost`，**看不出续期「成功」过**。
+
+三处修：① 续期量化加**下限 1ms**（与写路径 go-redis `formatMs` 的抬升一致 ⇒ 不会出现「写 1ms、续期 0ms」的自相矛盾）；② Lua 脚本自身兜住：`ARGV[2] <= 0` 时只返回 0、**绝不执行 PEXPIRE 0**（双保险）；③ watchdog 间隔在由 ttl 推导时取 1ms 下限（显式 `WithRenewInterval` 不受影响）。
+
+补 4 条回归用例：亚毫秒续期后**锁必须仍在**、脚本对 ≤0 毫秒返回 0 且不删键、`ttlMillis` 量化边界、亚毫秒 + 自动续期的观察窗口（#54）
+
 ## [v0.10.6] — 2026-10-28
 
 - fix(distlock): `WithRetryInterval(0/负值)` 被无条件写入 ⇒ `Lock()` 里的 `time.NewTicker` 直接 panic（"non-positive interval for NewTicker"）——一个选项参数把进程带崩。修法：选项忽略非正值（保留默认 100ms），`Lock()` 再兜一层
