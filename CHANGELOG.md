@@ -1,3 +1,7 @@
+## [v0.10.8] — 2026-10-29
+
+- build: 依赖地板对齐——concurrency 抬到 v0.23.2
+
 ## [v0.10.7] — 2026-10-28
 
 - fix(distlock): 续期的亚毫秒 TTL 不得删锁——PEXPIRE 0 在 Redis 里等价于立即删除
