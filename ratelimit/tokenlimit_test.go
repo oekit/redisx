@@ -23,6 +23,15 @@ type flakyScripter struct {
 	fail      bool
 	delay     time.Duration
 	callCount int
+	// bizCallCount 只数**业务路径**的脚本调用（排除后台探活）。
+	//
+	// 为什么要分开（2026-10-30 修）：探活与业务共用同一个 Scripter，
+	// 而探活脚本**本来就会打 Redis**（设计如此：探活就是探 Redis 通不通）。
+	// 「fallback 期间不再触碰 Redis」这条断言真正要管的是**业务路径**
+	// 不再发 EVAL——但混在一个计数器里时，后台探活那一次 EVAL 会把计数
+	// 顶上去 ⇒ 断言偶发红（实测 100 轮红 14 次，CI 上 2026-10-29
+	// 录到 calls 1 -> 2）。
+	bizCallCount int
 }
 
 func newFlakyScripter(inner redis.Scripter) *flakyScripter {
@@ -49,11 +58,31 @@ func (f *flakyScripter) calls() int {
 	return f.callCount
 }
 
+// bizCalls 返回累计的**业务路径**脚本调用次数（排除后台探活）。
+func (f *flakyScripter) bizCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.bizCallCount
+}
+
+// isProbeCall 判定该次脚本调用是否来自**后台探活**。
+//
+// 判据是**是否带 key**：探活脚本不带 key（`probeScript.Run(ctx, store, nil)`），
+// 业务路径带 2 个 key（tokenKey + timestampKey）。
+//
+// 为什么不用脚本文本判：go-redis 的 `Script.Run` 走 EVALSHA（miss 才回退 EVAL），
+// EVALSHA 只拿到摘要、拿不到脚本文本 ⇒ 文本判据在 EVALSHA 路径上失效。
+// key 数量在两条路径上都稳定 ⇒ 这是唯一可靠的来源判据。
+func isProbeCall(keys []string) bool { return len(keys) == 0 }
+
 // recordCall 记一次脚本调用并返回当前故障开关与模拟 RT.
-func (f *flakyScripter) recordCall() (fail bool, delay time.Duration) {
+func (f *flakyScripter) recordCall(keys []string) (fail bool, delay time.Duration) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.callCount++
+	if !isProbeCall(keys) {
+		f.bizCallCount++
+	}
 	return f.fail, f.delay
 }
 
@@ -66,7 +95,7 @@ func boom() *redis.Cmd {
 // 各 Eval 变体逐一透传（EvalSha 路径收到的是脚本摘要，必须走 inner.EvalSha，
 // 不能混用 Eval，否则摘要会被当成脚本文本编译失败）.
 func (f *flakyScripter) Eval(ctx context.Context, script string, keys []string, args ...any) *redis.Cmd {
-	fail, delay := f.recordCall()
+	fail, delay := f.recordCall(keys)
 	if fail {
 		return boom()
 	}
@@ -77,7 +106,7 @@ func (f *flakyScripter) Eval(ctx context.Context, script string, keys []string, 
 }
 
 func (f *flakyScripter) EvalSha(ctx context.Context, sha1 string, keys []string, args ...any) *redis.Cmd {
-	fail, delay := f.recordCall()
+	fail, delay := f.recordCall(keys)
 	if fail {
 		return boom()
 	}
@@ -88,7 +117,7 @@ func (f *flakyScripter) EvalSha(ctx context.Context, sha1 string, keys []string,
 }
 
 func (f *flakyScripter) EvalRO(ctx context.Context, script string, keys []string, args ...any) *redis.Cmd {
-	fail, delay := f.recordCall()
+	fail, delay := f.recordCall(keys)
 	if fail {
 		return boom()
 	}
@@ -99,7 +128,7 @@ func (f *flakyScripter) EvalRO(ctx context.Context, script string, keys []string
 }
 
 func (f *flakyScripter) EvalShaRO(ctx context.Context, sha1 string, keys []string, args ...any) *redis.Cmd {
-	fail, delay := f.recordCall()
+	fail, delay := f.recordCall(keys)
 	if fail {
 		return boom()
 	}
@@ -217,18 +246,22 @@ func TestTokenLimiter_Fallback_Engage(t *testing.T) {
 	if !l.Allow(ctx) {
 		t.Fatal("expected fallback to allow first request")
 	}
-	callsAfterFirst := flaky.calls()
+	callsAfterFirst := flaky.bizCalls()
 	if callsAfterFirst == 0 {
 		t.Fatal("expected at least one redis script attempt")
 	}
 
 	// 后续：redisAlive 已翻转，判定直接走本地桶，不再触碰 Redis。
 	//
-	// ⚠️ 翻转由 **ping ticker** 驱动（WithTokenPingInterval）⇒ 断言「不再触碰
-	// Redis」之前必须**等它真的翻转**。此前直接断言 ⇒ CI 慢机上 ticker 还没跑到
-	// 就进了循环 ⇒ 下一次 Allow 仍探了一次 Redis ⇒ 计数 +1 ⇒ 偶发红
-	// （2026-10-27 CI 实录：calls 1 -> 2）。与姊妹用例 Fallback_Recover 同款
-	// 有界等待写法。
+	// ⚠️ 断言口径必须用**业务路径**计数（bizCalls）而非全部调用（calls）：
+	// 后台探活（waitForRedis → probe）**设计上就会打 Redis**（探活就是
+	// 探 Redis 通不通），它与业务共用同一个 Scripter ⇒ 混在一个计数器里时，
+	// 探活那一次 EVAL 会把计数顶上去 ⇒ 断言偶发红（实测 100 轮红 14 次；
+	// CI 上 2026-10-29 录到 calls 1 -> 2）。
+	//
+	// 注：2026-10-27 那次修复把断言改成"等 redisAlive 翻转"是**无效修复**——
+	// redisAlive=false 是在 startMonitor 里**同步**置位的（不是 ticker 驱动），
+	// 真正的竞态是「取基线」与「探活首次 EVAL」的先后次序。
 	deadline := time.Now().Add(2 * time.Second)
 	for l.redisAlive.Load() && time.Now().Before(deadline) {
 		time.Sleep(2 * time.Millisecond)
@@ -241,8 +274,8 @@ func TestTokenLimiter_Fallback_Engage(t *testing.T) {
 			t.Fatalf("allow %d: expected local fallback to allow", i+1)
 		}
 	}
-	if got := flaky.calls(); got != callsAfterFirst {
-		t.Fatalf("expected no redis traffic while in fallback, calls %d -> %d", callsAfterFirst, got)
+	if got := flaky.bizCalls(); got != callsAfterFirst {
+		t.Fatalf("expected no redis traffic in business path while in fallback, biz calls %d -> %d", callsAfterFirst, got)
 	}
 }
 
