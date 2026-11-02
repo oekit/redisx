@@ -8,7 +8,7 @@
 
 ## [v0.10.7] — 2026-10-28
 
-- fix(distlock): 续期的亚毫秒 TTL 不得删锁——PEXPIRE 0 在 Redis 里等价于立即删除
+- #54：fix(distlock): 续期的亚毫秒 TTL 不得删锁——PEXPIRE 0 在 Redis 里等价于立即删除
 
 `Renew` 把 TTL 量化为毫秒（`ttl.Milliseconds()`），而 **0 < ttl < 1ms 时量化结果是 0** ⇒ Redis 收到 `PEXPIRE key 0` ⇒ 按 Redis 语义**直接删除该键**并回复 1 ⇒ Go 侧返回 `(true, nil)`。
 
