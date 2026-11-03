@@ -9,7 +9,7 @@ import (
 
 // Batch 封装 Redis Pipeline 批量操作。
 // 将多个命令打包发送，减少网络往返次数。
-// 与直接使用 Pipeline 不同，Batch 自动处理 key 前缀转换。
+// Batch 自动处理 key 前缀转换（与 Pipeline 代理同口径）。
 type Batch struct {
 	client *Client
 	pipe   redis.Pipeliner

@@ -281,8 +281,8 @@ func TestSortedSetOps(t *testing.T) {
 }
 
 func TestPipeline_TxPipeline(t *testing.T) {
-	// Pipeline/TxPipeline 走底层 client（不自动应用 prefix），
-	// 所以测试用空 prefix 的 client 以避免混乱。
+	// 基础执行语义（空 prefix 无键转换）；带前缀落同键的回归见
+	// pipeline_convertkey_test.go（redisx#79）。
 	c, _ := newTestClient(t, "")
 	ctx := context.Background()
 
