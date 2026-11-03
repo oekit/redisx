@@ -35,20 +35,19 @@ func (c *Client) ZCard(ctx context.Context, key string) *redis.IntCmd {
 
 // ==================== Pipeline ====================
 
-// Pipeline 创建一个管道（批量发送命令，减少网络往返）。
+// Pipeline 创建管道代理（批量发送命令，减少网络往返）。
 //
-// 注意：返回的 Pipeline 不会自动添加 key 前缀。
-// 如需前缀处理，请使用 NewBatch()。
-func (c *Client) Pipeline() redis.Pipeliner {
-	return c.client.Pipeline()
+// 与单发命令同口径：管道上排队的命令同样经 convertKey 应用 key 前缀。
+// 此前直接返回裸 redis.Pipeliner，管道命令绕过前缀——配了前缀的部署里
+// 同一逻辑键在「管道」与「单发」落到不同物理键，静默分叉（redisx#79）。
+// 覆盖面与裸管道逃生舱见 Pipeline 类型文档。
+func (c *Client) Pipeline() *Pipeline {
+	return &Pipeline{client: c, pipe: c.client.Pipeline()}
 }
 
-// TxPipeline 创建一个事务管道。
-//
-// 注意：返回的 Pipeline 不会自动添加 key 前缀。
-// 如需前缀处理，请使用 NewBatch()。
-func (c *Client) TxPipeline() redis.Pipeliner {
-	return c.client.TxPipeline()
+// TxPipeline 创建事务管道（MULTI/EXEC），键转换口径与 Pipeline 相同。
+func (c *Client) TxPipeline() *Pipeline {
+	return &Pipeline{client: c, pipe: c.client.TxPipeline()}
 }
 
 // ==================== Pub/Sub ====================
