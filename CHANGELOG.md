@@ -1,3 +1,11 @@
+## [v0.11.0] — 2026-11-03
+
+- feat(redisx): Pipeline()/TxPipeline() 改返键前缀代理 *Pipeline——convertKey 全覆盖、未覆盖命令编译期拦截（#79）
+- feat(redisx): Client.GetDel/GetDelCompat 取即删——<6.2 时 Lua 单次原子回退，核销不双花（#78）
+- ⚠️ breaking：Pipeline()/TxPipeline() 返回类型 redis.Pipeliner → *redisx.Pipeline，需要原生管道的场景走 Raw()
+
+关联问题单：redisx#78、redisx#79。
+
 ## [v0.10.9] — 2026-11-02
 
 - build: 矩阵内依赖地板 `pkg` v0.31.0 → v0.31.1（维护轮全量对齐；本版不含 API 变更）
