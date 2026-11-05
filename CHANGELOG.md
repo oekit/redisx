@@ -1,3 +1,7 @@
+## [v0.11.1] — 2026-11-06
+
+- build: 矩阵依赖地板对齐（维护轮 #233）
+
 ## [v0.11.0] — 2026-11-03
 
 - feat(redisx): Pipeline()/TxPipeline() 改返键前缀代理 *Pipeline——convertKey 全覆盖、未覆盖命令编译期拦截（#79）
