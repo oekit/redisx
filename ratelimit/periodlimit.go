@@ -57,11 +57,18 @@ func WithPeriodAlign() PeriodOption {
 
 // NewPeriodLimit 创建固定窗口限流器。
 //
-// period 为窗口时长（按秒取整，不足 1s 按 1s）；quota 为窗口内配额；
+// period 为窗口时长（按秒取整，不足 1s 按 1s）；quota 为窗口内配额（必须 > 0）；
 // store 为任意 go-redis v9 Scripter 实现（Client/ClusterClient/Ring）；
 // keyPrefix 为 key 命名空间，最终 Redis key 为 "keyPrefix:key"（keyPrefix
 // 为空时直接用 key）。同一 (keyPrefix, key) 的所有实例共享同一份配额。
+//
+// quota <= 0 属于编程错误，直接 panic（fail-fast，与 NewTokenLimiter 对
+// rate/burst 的校验口径一致）——静默接受会让 Lua 的 current < limit /
+// current == limit 均不成立，每次 Take 都 OverQuota，流量 100% 被拒且无报错（#92）。
 func NewPeriodLimit(period time.Duration, quota int64, store redis.Scripter, keyPrefix string, opts ...PeriodOption) *PeriodLimit {
+	if quota <= 0 {
+		panic("ratelimit: quota must be positive")
+	}
 	window := int64(period / time.Second)
 	if window < 1 {
 		window = 1

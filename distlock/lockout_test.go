@@ -196,6 +196,43 @@ func TestLockout_KeyIsolation(t *testing.T) {
 	}
 }
 
+// TestLockout_SubMillisecondWindowPenalty 回归（#93）：Window/Penalty < 1ms 时
+// Milliseconds() 截断为 0，`PEXPIRE key 0` 在 Redis 语义是立即删键——失败
+// 计数每次写完即蒸发（Fail 恒返回 0），防爆破锁永不触发。传参走 ttlMillis
+// （下限 1ms）后：计数正常累积、达阈值锁定、惩罚 1ms 后正常解除。
+func TestLockout_SubMillisecondWindowPenalty(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	clock := &lockoutClock{nowFn: func() time.Time { return now }}
+	l, mr := newLockoutTest(t, clock, func(c *LockoutConfig) {
+		c.Threshold = 2
+		c.Window = 500 * time.Microsecond
+		c.Penalty = 500 * time.Microsecond
+	})
+	ctx := context.Background()
+
+	// 计数须跨调用累积（未修时窗口 ZSET 每次写完即被 PEXPIRE 0 删除，恒返回 0）
+	n, err := l.Fail(ctx, "k")
+	if err != nil || n != 1 {
+		t.Fatalf("fail 1 = (%d, %v), want (1, nil)", n, err)
+	}
+	n, err = l.Fail(ctx, "k")
+	if err != nil || n != 2 {
+		t.Fatalf("fail 2 = (%d, %v), want (2, nil)", n, err)
+	}
+
+	// 达阈值即锁定（miniredis 的 TTL 仅经 FastForward 推进，1ms 不会自己跑掉）
+	locked, remain, err := l.Check(ctx, "k")
+	if err != nil || !locked {
+		t.Fatalf("Check = (%v, %v, %v), want locked", locked, remain, err)
+	}
+
+	// 惩罚被抬到 1ms：FastForward 越过后锁定解除（被抬底而非长生不老）
+	mr.FastForward(2 * time.Millisecond)
+	if locked, _, _ := l.Check(ctx, "k"); locked {
+		t.Fatal("lock must expire after the 1ms floored penalty, not persist forever")
+	}
+}
+
 func TestLockout_Validation(t *testing.T) {
 	mr := miniredis.RunT(t)
 	cfg := LockoutConfig{Threshold: 3, Window: time.Minute, Penalty: time.Minute}
