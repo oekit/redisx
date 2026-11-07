@@ -8,10 +8,10 @@ github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UF
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/klauspost/cpuid/v2 v2.4.0 h1:S6Hrbc7+ywsr0r+RLapfGBHfyefhCTwEh3A0tV913Dw=
 github.com/klauspost/cpuid/v2 v2.4.0/go.mod h1:19jmZ9mjzoF//ddRSUsv0zfBTJWh3QJh9FNxZTMrGxU=
-github.com/oekit/concurrency v0.28.3 h1:58u4i/NTSuI1Dzbcm8wsRaairVfbA/CUYMhdpPCNTA8=
-github.com/oekit/concurrency v0.28.3/go.mod h1:yjKEeriuksfgZdVH5GES+L8FO0KfxzaoCA5o6UrvdPc=
-github.com/oekit/logx v0.8.8 h1:VaxgjmDVszqqr4k+vNtBVczBSMfYjWAdFrTWQrb/Wak=
-github.com/oekit/logx v0.8.8/go.mod h1:wUsASSs8nfRzr/l7rpf+96q1VyPY74S3EdkBKCVxajo=
+github.com/oekit/concurrency v0.28.4 h1:BqOy33UttpyyKYGLbBfrhiybVo8ughZVIbzMB3VnGlE=
+github.com/oekit/concurrency v0.28.4/go.mod h1:a3yn4rwxNfDrhdY8X0ypAv4REoEtczqyHPuIajvacu0=
+github.com/oekit/logx v0.8.10 h1:HmTvGEE86Ly37HtNU3uYjv0e3Fgb1WNT8jbhW3AEknI=
+github.com/oekit/logx v0.8.10/go.mod h1:v3nw4RZZfVT2smiSJFp29xhPmCopEuyEhEA2a8AUhsc=
 github.com/oekit/pkg v0.37.4 h1:zc9/GDcZkhyEPISZuQ/v+BBEORed9UiGXY16O0tHOSw=
 github.com/oekit/pkg v0.37.4/go.mod h1:sVeOtmG1sLY2aSnzFIbUAF2Qoh7G8R5vnWtWmLCv8NM=
 github.com/redis/go-redis/v9 v9.23.0 h1:/TTVdJa8BRNsybwwGGnmiYktHNlUXtbOQxlWpHBPL3s=
