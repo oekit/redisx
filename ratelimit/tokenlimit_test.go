@@ -405,7 +405,7 @@ func TestTokenLimiter_UnknownResponse_FallbackEngages(t *testing.T) {
 	}
 }
 
-// TestTokenLimiter_HighRateLowBurst_TTLFloor 回归（#91）：rate > 2*burst 时
+// TestTokenLimiter_HighRateLowBurst_TTLFloor 回归（#91，重报 #99）：rate > 2*burst 时
 // floor(capacity/rate*2) == 0，`SETEX key 0` 报 "invalid expire time" ⇒
 // 脚本每次必失败（未开兜底 = 全部拒绝；开了 = 永久降级本地桶）。
 // 脚本 TTL 取 math.max(1, ...) 下限后须正常判定且 key 正常落地。

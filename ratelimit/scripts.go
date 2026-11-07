@@ -25,7 +25,7 @@ else
 end`
 
 // tokenLimitLua 令牌桶 Lua 脚本，移植 go-zero core/limit/tokenscript.lua，
-// 唯一偏离（#91）：TTL 取 math.max(1, ...) 下限。
+// 唯一偏离（#91，重报 #99）：TTL 取 math.max(1, ...) 下限。
 //
 // 参数：KEYS[1]=令牌数 key；KEYS[2]=上次回补时间戳 key；
 // ARGV[1]=速率 rate；ARGV[2]=容量 capacity；ARGV[3]=当前 unix 秒；ARGV[4]=本次请求数 requested。
@@ -33,7 +33,7 @@ end`
 // 惰性回补：按 (now-last_refreshed)*rate 回补令牌（封顶 capacity），
 // 两个 key 均以 2*fill_time 的 TTL 落地；KEYS 须同 slot（hash-tag）。
 //
-// TTL 下限 1s（#91）：rate > 2*burst（如 1000/s、burst=1）时
+// TTL 下限 1s（#91，重报 #99）：rate > 2*burst（如 1000/s、burst=1）时
 // floor(capacity/rate*2) == 0，而 `SETEX key 0` 在 Redis 语义是报错
 // "invalid expire time" ⇒ 脚本每次必失败（开 fallback 则永久降级本地桶，
 // 不开则所有请求被拒）。与 distlock ttlMillis 的 1ms 下限（#54）同族护栏，

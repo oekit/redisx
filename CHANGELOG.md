@@ -1,3 +1,9 @@
+## [v0.11.3] — 2026-11-08
+
+- docs(ratelimit): #99 收口——该单为 #91 的重报（tokenLimitLua TTL 整除 0 致 SETEX invalid expire time、限流器每次判定必失败），修复已随 v0.11.2（PR #94）落地（TTL 下限 1s，含 rate=1000/s、burst=1 的 miniredis 契约回归测试）；本版把 scripts.go 与回归测试的注释标注对齐重报单号，无行为变更
+
+关联问题单：redisx#91、redisx#99。
+
 ## [v0.11.2] — 2026-11-07
 
 - fix(ratelimit): tokenLimitLua TTL 整除为 0（rate > 2×burst）时 SETEX 0 报错关闭——TTL 下限 1s，限流器不再每次判定必失败（#91）
