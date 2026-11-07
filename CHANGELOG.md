@@ -1,3 +1,11 @@
+## [v0.11.2] — 2026-11-07
+
+- fix(ratelimit): tokenLimitLua TTL 整除为 0（rate > 2×burst）时 SETEX 0 报错关闭——TTL 下限 1s，限流器不再每次判定必失败（#91）
+- fix(ratelimit): NewPeriodLimit 对 quota<=0 fail-fast panic——与 NewTokenLimiter 校验哲学对齐，全量静默拒绝面关闭（#92）
+- fix(distlock): Lockout Window/Penalty 毫秒截断 0 关闭——复用 ttlMillis 下限 1ms，PEXPIRE 0 立即删键不再发生（#93）
+
+关联问题单：redisx#91、redisx#92、redisx#93。
+
 ## [v0.11.1] — 2026-11-06
 
 - build: 矩阵依赖地板对齐（维护轮 #233）
