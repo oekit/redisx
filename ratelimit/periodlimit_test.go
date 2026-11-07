@@ -221,6 +221,28 @@ func TestPeriodLimit_WithPeriodAlign(t *testing.T) {
 	}
 }
 
+// TestPeriodLimit_PanicOnInvalidQuota 回归（#92）：quota<=0 属于编程错误，
+// fail-fast panic（与 NewTokenLimiter 对 rate/burst 的校验口径一致）——
+// 静默接受会让 Lua 的 current < limit / current == limit 均不成立，
+// 每次 Take 都 OverQuota，流量 100% 被拒且无任何报错。
+func TestPeriodLimit_PanicOnInvalidQuota(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	for name, fn := range map[string]func(){
+		"zero quota":     func() { NewPeriodLimit(time.Minute, 0, store, "x") },
+		"negative quota": func() { NewPeriodLimit(time.Minute, -1, store, "x") },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("%s: expected panic", name)
+				}
+			}()
+			fn()
+		}()
+	}
+}
+
 func TestPeriodLimit_SubSecondPeriodClampedToOneSecond(t *testing.T) {
 	store, _ := newTestStore(t)
 	l := NewPeriodLimit(300*time.Millisecond, 1, store, "pfx")
