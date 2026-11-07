@@ -405,6 +405,33 @@ func TestTokenLimiter_UnknownResponse_FallbackEngages(t *testing.T) {
 	}
 }
 
+// TestTokenLimiter_HighRateLowBurst_TTLFloor 回归（#91）：rate > 2*burst 时
+// floor(capacity/rate*2) == 0，`SETEX key 0` 报 "invalid expire time" ⇒
+// 脚本每次必失败（未开兜底 = 全部拒绝；开了 = 永久降级本地桶）。
+// 脚本 TTL 取 math.max(1, ...) 下限后须正常判定且 key 正常落地。
+func TestTokenLimiter_HighRateLowBurst_TTLFloor(t *testing.T) {
+	store, mr := newTestStore(t)
+	// rate=1000 > 2*burst=2：fill_time=1ms，未加下限时 ttl=floor(0.002)=0
+	l := NewTokenLimiter(1000, 1, store, "t91")
+	ctx := context.Background()
+
+	// 未修时首个 Allow 即因脚本报错走 fail-closed 返回 false
+	if !l.Allow(ctx) {
+		t.Fatal("expected allow within burst despite rate > 2*burst")
+	}
+
+	// 双 key 均落地且 TTL >= 1s（SETEX 0 报错时 key 不会存在）
+	if !mr.Exists("{t91}.tokens") || !mr.Exists("{t91}.ts") {
+		t.Fatalf("expected bucket keys to exist, got keys %v", mr.Keys())
+	}
+	if ttl := mr.TTL("{t91}.tokens"); ttl < time.Second {
+		t.Fatalf("expected {t91}.tokens TTL >= 1s, got %v", ttl)
+	}
+	if ttl := mr.TTL("{t91}.ts"); ttl < time.Second {
+		t.Fatalf("expected {t91}.ts TTL >= 1s, got %v", ttl)
+	}
+}
+
 func TestTokenLimiter_PanicOnInvalidParams(t *testing.T) {
 	store, _ := newTestStore(t)
 
