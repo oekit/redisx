@@ -1,3 +1,7 @@
+## [v0.11.4] — 2026-11-08
+
+- build: 依赖地板对齐——本版把 oekit 依赖地板抬到各依赖当前最新已发布版本（matrix-tools/scripts/align_floors.py 维护轮）
+
 ## [v0.11.3] — 2026-11-08
 
 - docs(ratelimit): #99 收口——该单为 #91 的重报（tokenLimitLua TTL 整除 0 致 SETEX invalid expire time、限流器每次判定必失败），修复已随 v0.11.2（PR #94）落地（TTL 下限 1s，含 rate=1000/s、burst=1 的 miniredis 契约回归测试）；本版把 scripts.go 与回归测试的注释标注对齐重报单号，无行为变更
