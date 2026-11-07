@@ -120,6 +120,10 @@ func (l *Lockout) validate() error {
 
 // Fail 记一次失败事件，返回当前窗口内的失败计数（达阈值时已完成锁定置位，
 // locked 状态经 Check 查询）。Redis 故障返回 error。
+//
+// Window/Penalty 传参走 ttlMillis（毫秒下限 1ms，#93）：Window < 1ms 时
+// Milliseconds() 截断为 0，而 `PEXPIRE key 0` 在 Redis 语义是立即删键——
+// 失败计数每次写完即蒸发，防爆破锁永不触发（与续期 TTL 的 #54 同族护栏）。
 func (l *Lockout) Fail(ctx context.Context, key string) (int64, error) {
 	if key == "" {
 		return 0, fmt.Errorf("distlock: lockout key must not be empty")
@@ -128,8 +132,8 @@ func (l *Lockout) Fail(ctx context.Context, key string) (int64, error) {
 		return 0, err
 	}
 	n, err := lockoutFailScript.Run(ctx, l.client, l.keys(key),
-		l.now().UnixMilli(), l.cfg.Window.Milliseconds(), l.cfg.Threshold,
-		l.cfg.Penalty.Milliseconds()).Int64()
+		l.now().UnixMilli(), ttlMillis(l.cfg.Window), l.cfg.Threshold,
+		ttlMillis(l.cfg.Penalty)).Int64()
 	if err != nil {
 		return 0, fmt.Errorf("redis lockout fail failed: %w", err)
 	}
