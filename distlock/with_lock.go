@@ -4,7 +4,16 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/oekit/logx"
 )
+
+// instanceLogger 由持有 per-instance logger 的 Locker 实现提供（#120）：
+// WithLock 等接口层入口经此取用实例自己的 logger，注入的告警只进该实例的
+// logger 而非进程全局；未实现的实现回退包级缺省（行为不变）。
+type instanceLogger interface {
+	logr() logx.Logger
+}
 
 // WithLock 是便捷包装：加锁 → 执行 fn → 自动释放锁。
 // 使用 Lock（带超时重试）获取锁，确保在并发场景下更可靠。
@@ -22,7 +31,13 @@ func WithLock(ctx context.Context, locker Locker, key string, ttl time.Duration,
 		// 分布式锁释放失败可能导致孤儿锁直到 TTL 过期，
 		// 记录日志便于运维定位，不掩盖失败。
 		if e := locker.Unlock(context.WithoutCancel(ctx), key, ownerID); e != nil {
-			log.Warn("distlock unlock failed", "key", key, "owner", ownerID, "err", e)
+			// per-instance logger 优先（#120）：RedisLocker 经 WithLogger
+			// 注入的 logger 在这里同样生效；其它实现用包级缺省。
+			lg := log
+			if p, ok := locker.(instanceLogger); ok {
+				lg = p.logr()
+			}
+			lg.Warn("distlock unlock failed", "key", key, "owner", ownerID, logx.ErrKey, e)
 		}
 	}()
 	return fn()

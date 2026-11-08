@@ -12,8 +12,6 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-var redisLog = logx.Delegating("cache-redis")
-
 // defaultNullTTL 是 NullTTL 未设置（0）时的空值缓存默认 TTL。
 const defaultNullTTL = 1 * time.Minute
 
@@ -41,6 +39,15 @@ type RedisConfig[T any] struct {
 	//     下次 GetOrLoad 会重新调用 Source）；
 	//   - 正值：按指定时长缓存 null marker。
 	NullTTL time.Duration
+
+	// Logger per-instance 日志注入（#120，与 oagentkit sqllease 的
+	// WithLeaderLogger 同形态的构造期注入点）：回填失败/序列化失败等内部
+	// 告警只进该 logger——宿主用 zap/slog/hlog 时无需动进程级
+	// logx.SetDefault（那会同时改掉所有 logx 使用方的落点），即可单独
+	// 收编本实例的日志。nil（未设置）时使用本实例私有的
+	// logx.Delegating("cache-redis")——与历史包级缺省行为完全一致
+	// （懒解析 logx.Default，宿主未 SetDefault 时落 stderr）。
+	Logger logx.Logger
 }
 
 // RedisCache 是基于 Redis 的泛型缓存实现。
@@ -49,6 +56,9 @@ type RedisCache[T any] struct {
 	client  redis.UniversalClient
 	cfg     RedisConfig[T]
 	nullTTL time.Duration
+	// log 是 per-instance 日志（#120）：cfg.Logger 注入或缺省
+	// logx.Delegating("cache-redis")，构造期定死、运行期只读。
+	log logx.Logger
 }
 
 // 编译期接口契约：RedisCache 实现 data/cache 门面接口（泛型接口取具体
@@ -74,6 +84,10 @@ func NewRedisCache[T any](client redis.UniversalClient, cfg RedisConfig[T]) *Red
 		client:  client,
 		cfg:     cfg,
 		nullTTL: nullTTL,
+		log:     logx.Delegating("cache-redis"),
+	}
+	if cfg.Logger != nil {
+		c.log = cfg.Logger
 	}
 
 	if c.cfg.Serializer == nil {
@@ -163,7 +177,7 @@ func (c *RedisCache[T]) GetOrLoad(ctx context.Context, key string) (*T, error) {
 		// 缓存空值防穿透
 		if c.nullTTL > 0 {
 			if setErr := c.client.Set(ctx, c.fullKey(key), nullValue, c.nullTTL).Err(); setErr != nil {
-				redisLog.Error("set null value error", "key", key, "err", setErr)
+				c.log.Error("set null value error", "key", key, logx.ErrKey, setErr)
 			}
 		}
 		return nil, nil
@@ -171,7 +185,7 @@ func (c *RedisCache[T]) GetOrLoad(ctx context.Context, key string) (*T, error) {
 
 	data, err := c.cfg.Serializer(source)
 	if err != nil {
-		redisLog.Error("serialize error", "key", key, "err", err)
+		c.log.Error("serialize error", "key", key, logx.ErrKey, err)
 		return source, nil // 序列化失败仍返回数据
 	}
 
@@ -180,7 +194,7 @@ func (c *RedisCache[T]) GetOrLoad(ctx context.Context, key string) (*T, error) {
 		ttl = 24 * time.Hour
 	}
 	if err := c.client.Set(ctx, c.fullKey(key), data, ttl).Err(); err != nil {
-		redisLog.Error("set error", "key", key, "err", err)
+		c.log.Error("set error", "key", key, logx.ErrKey, err)
 	}
 
 	return source, nil
@@ -329,7 +343,7 @@ func (c *RedisCache[T]) Exists(ctx context.Context, key string) (bool, error) {
 // 必须配置 Source 函数。
 func (c *RedisCache[T]) Refresh(ctx context.Context, key string) (*T, error) {
 	if err := c.Del(ctx, key); err != nil {
-		redisLog.Error("refresh del error", "key", key, "err", err)
+		c.log.Error("refresh del error", "key", key, logx.ErrKey, err)
 	}
 	return c.GetOrLoad(ctx, key)
 }
