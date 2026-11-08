@@ -25,6 +25,11 @@
 // 空值缓存语义（防穿透）见 RedisConfig.NullTTL 字段注释，与 LocalCache
 // 保持一致：0 = 默认开启（1 分钟），负值 = 显式禁用。
 //
+// 日志：内部告警（回填失败/序列化失败等）缺省走实例私有的
+// logx.Delegating("cache-redis")（懒解析进程级 logx.Default）；需要单独
+// 收编进宿主日志体系（zap/slog/hlog）时经 RedisConfig.Logger 注入
+// per-instance logger，不影响其它 logx 使用方（#120）。
+//
 // null 标记保留前缀契约：null 标记哨兵以 \x00 开头（见 redis.go
 // nullValue），合法 JSON 序列化输出不会自然撞上该前缀。SetRaw 等原始
 // 写入入口不得写入以 \x00 开头的值——精确等于哨兵的条目按 null marker

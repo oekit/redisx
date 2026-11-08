@@ -1,12 +1,16 @@
 // Package ratelimit 提供基于 Redis 的分布式限流器。
 //
-// 包含两种限流器，Lua 脚本与三态返回语义忠实移植 go-zero core/limit
+// 包含三种限流器，Lua 脚本与三态返回语义忠实移植 go-zero core/limit
 // （periodscript.lua / tokenscript.lua），可与其混部共用同一份 Redis 配额：
 //
 //   - [PeriodLimit]：固定窗口计数限流（INCRBY + EXPIRE 原子脚本）。
 //     Take 返回三态（[Allowed] / [HitQuota] / [OverQuota]）。
 //   - [TokenLimiter]：令牌桶限流（双 key 惰性回补）。
 //     Allow/AllowN 返回 bool；可选进程内兜底（[WithTokenFallback]）。
+//   - [ResilientLimiter]（#118）：[PeriodLimit] 的「带兜底」组合——Redis
+//     分布式固定窗口 + Redis 故障时本地令牌桶降级（[LocalLimiter]）+
+//     三态 Unknown 的 fail-open/fail-closed 口径单源（[FailMode]），
+//     判定依据以 [Decision.Source] 显式上报（[WithFallbackMetrics]）。
 //
 // # 存储抽象
 //
@@ -38,7 +42,31 @@
 // 与 TokenLimiter 不同，PeriodLimit **不做**本地兜底：固定窗口计数是跨实例的
 // 全局精确配额，故障窗口内进程无法在不破坏全局限额的前提下本地近似——本地
 // 放行多少都会放大全局限额。因此 Redis 故障时 Take 直接返回 (Unknown, err)，
-// fail-open 还是 fail-closed 由调用方业务决定。
+// fail-open 还是 fail-closed 由调用方业务决定。要把「降级到本地令牌桶 +
+// fail 口径 + 降级可观测」这套组合口径单源化（不再每个下游各写一遍），直接
+// 用 [ResilientLimiter]——Redis 路径完全复用 PeriodLimit（同一脚本、同一
+// key 布局），其语义约束（本地桶不破坏全局限额的诚实说明）见下节。
+//
+// # 组合原语 ResilientLimiter（#118）
+//
+//	l := ratelimit.NewResilientLimiter(
+//	    ratelimit.NewPeriodLimit(time.Minute, 100, rdb, "api"),
+//	    func(key string) ratelimit.LocalLimiter { return perKeyBucket(key) },
+//	    ratelimit.WithFailMode(ratelimit.FailModeOpen),          // 默认
+//	    ratelimit.WithFallbackMetrics(func(s ratelimit.Source) { /* metrics */ }),
+//	)
+//	d, err := l.Allow(ctx, "user:42") // d.Source: redis / local-fallback / fail-open / fail-closed
+//
+// Redis 正常时即 PeriodLimit 语义；故障（Unknown，含 ctx 超时/取消）时按
+// [FailMode] 降级：默认 fail-open——有本地桶按本地桶余量放行/拒绝
+// （[SourceLocalFallback]，每 key 独立、限速语义仍在，仅失去跨实例全局
+// 精确性——与 TokenLimiter 兜底同一诚实口径），无桶直接放行
+// （[SourceFailOpen]）；[FailModeClosed] 一律拒绝（[SourceFailClosed]），
+// 适合超配额后果不可逆的业务。每次 Allow 都先试 Redis（无探活后台
+// goroutine），Redis 恢复后下一次判定自动切回 [SourceRedis]，不会永久钉在
+// 本地兜底；故障期间每次请求多付一次失败的往返，由调用方 ctx 超时兜底。
+// 三态 Unknown 与「配额拒绝」经 Source 严格区分——监控不会把 Redis 故障
+// 算成攻击流量。
 //
 // # 令牌桶 TokenLimiter
 //

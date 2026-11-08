@@ -14,7 +14,11 @@
 //     持有者崩溃后槽位 slotTTL 过期自愈
 //   - 便捷包装 WithLock（加锁→执行→自动释放）
 //   - 可选无 Redis 时降级放行（单实例部署场景）
-//   - 支持 redis.UniversalClient（兼容单机、集群、哨兵模式）
+//   - 可选 per-instance 日志注入（WithLogger，#120）：watchdog 告警只进
+//     注入的 logger；缺省实例私有的 logx.Delegating("distlock")，与历史
+//     行为一致
+//   - 支持 redis.UniversalClient（兼容单机、集群、哨兵模式）；Lockout
+//     三键共享 hash-tag，集群上 Lua 多键访问合法（#119）
 //
 // # 快速接入（推荐配合 ekit/data/redisx 使用）
 //

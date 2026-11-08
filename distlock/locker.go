@@ -14,6 +14,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// log 是包级缺省 logger（懒解析全局 Default）。#120 后 RedisLocker 的实例
+// 日志走 per-instance 的 l.log（缺省同样是 Delegating("distlock")，行为
+// 不变）；本变量仅剩接口层入口 WithLock 对**未实现 instanceLogger** 的
+// Locker 实现兜底时使用。
 var log = logx.Delegating("distlock")
 
 // ErrLockNotAcquired 表示锁被其他实例持有，获取失败。
@@ -75,6 +79,11 @@ type RedisLocker struct {
 	retryInterval       time.Duration
 	onLock              func(key string, acquired bool, err error)
 	onUnlock            func(key string, err error)
+	// log 是 per-instance 日志（#120）：构造期经 WithLogger 注入，缺省为
+	// 本实例私有的 logx.Delegating("distlock")（与既有包级缺省行为一致——
+	// 仍是懒解析全局 Default，宿主未 SetDefault 时落 stderr；区别是组件名
+	// 随实例携带，且注入后告警只进该实例的 logger，不再与进程全局耦合）。
+	log logx.Logger
 
 	// 自动续期相关
 	autoRenew     bool
@@ -113,6 +122,19 @@ func WithRetryInterval(d time.Duration) RedisLockerOption {
 			return
 		}
 		l.retryInterval = d
+	}
+}
+
+// WithLogger 注入 per-instance 日志（#120，与 oagentkit sqllease 的
+// WithLeaderLogger 同形）：自动续期 watchdog 的告警（续期失败/锁丢失/超过
+// 最大生命周期）只进该 logger，宿主的 zap/slog/hlog 体系无需动进程级
+// logx.SetDefault 即可收编本组件的日志。传 nil 保留缺省（实例私有的
+// logx.Delegating("distlock")，落点与历史行为一致）。
+func WithLogger(log logx.Logger) RedisLockerOption {
+	return func(l *RedisLocker) {
+		if log != nil {
+			l.log = log
+		}
 	}
 }
 
@@ -167,11 +189,21 @@ func NewRedisLocker(client redis.UniversalClient, opts ...RedisLockerOption) *Re
 		client:        client,
 		prefix:        "lock",
 		retryInterval: defaultRetryInterval,
+		log:           logx.Delegating("distlock"),
 	}
 	for _, opt := range opts {
 		opt(l)
 	}
 	return l
+}
+
+// logr 返回本实例的 logger（#120 的 instanceLogger 契约，供 WithLock 等
+// 接口层入口取用）；零值实例（未经构造器）兜底回包级缺省，绝不 nil。
+func (l *RedisLocker) logr() logx.Logger {
+	if l.log != nil {
+		return l.log
+	}
+	return log
 }
 
 func (l *RedisLocker) lockKey(key string) string {
@@ -493,19 +525,19 @@ func (l *RedisLocker) startAutoRenew(_ context.Context, key string, ownerID stri
 			case <-lifetimeC:
 				// 达到最大续期生命周期：放弃续期，锁将在 TTL 后自然过期。
 				// 这是忘记 Unlock 时的安全网（默认 10×ttl）。
-				log.Warn("auto renew exceeded max lifetime, giving up lock", "key", key, "max_lifetime", maxLifetime)
+				l.logr().Warn("auto renew exceeded max lifetime, giving up lock", "key", key, "max_lifetime", maxLifetime)
 				return
 			case <-ticker.C:
 				result, err := renewScript.Run(renewCtx, l.client, []string{l.lockKey(key)}, ownerID, ttlMillis(ttl)).Int()
 				if err != nil {
 					// 瞬时错误（网络抖动、failover）不放弃：下一个 tick 重试。
 					// 续期 goroutine 一旦退出，锁将在 TTL 后静默失效。
-					log.Warn("auto renew failed, will retry", "key", key, "err", err)
+					l.logr().Warn("auto renew failed, will retry", "key", key, logx.ErrKey, err)
 					continue
 				}
 
 				if result == 0 {
-					log.Warn("auto renew failed: lock lost or not owned", "key", key)
+					l.logr().Warn("auto renew failed: lock lost or not owned", "key", key)
 					return
 				}
 			}
