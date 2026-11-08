@@ -70,7 +70,10 @@ type LockoutConfig struct {
 //
 // 数据模型：失败窗口 ZSET（member=now_ms:seq，score=失败时刻 Unix 毫秒，
 // TTL=Window 空闲消亡）+ 锁定标记（SET PX Penalty，NX 不延长）+ 事件序号
-// 计数器；Fail/Check/Reset 全部 Lua 原子执行。
+// 计数器；Fail/Check/Reset 全部 Lua 原子执行。三键统一加 hash-tag
+// （实际 key 形如 "{<KeyPrefix><key>}"、"{<KeyPrefix><key>}:lock"、
+// "{<KeyPrefix><key>}:seq"，#119）保证 Redis Cluster 同 slot——单脚本访问
+// 多键的前提；单机/哨兵模式对花括号无感，key 命名仅多了字面 {...}。
 //
 // 典型装配（防爆破语义单源化）：Redis 本类型为主，concurrency/ratelimit.Lockout
 // 为进程内降级层；Redis 故障时的取舍由调用方决定（本类型不内置降级——
@@ -98,7 +101,16 @@ func NewLockout(client redis.UniversalClient, cfg LockoutConfig) *Lockout {
 }
 
 func (l *Lockout) keys(key string) []string {
-	return []string{l.prefix + key, l.prefix + key + ":lock", l.prefix + key + ":seq"}
+	// 三键共享同一 hash-tag（#119）：Redis Cluster 按完整 key 里**首个 {...}**
+	// 计算 slot，不加 tag 时三键（失败窗口/锁定标记/事件序号）按整 key 的
+	// CRC16 两两不同槽，lockoutFailScript 单脚本访问 KEYS[1..3] 在集群上报
+	// "Lua script attempted to access a non local key" ⇒ Fail() 每次失败、
+	// 失败计数永远写不进去，防爆破锁整体失效。统一把共同段 {prefix+key} 包进
+	// 花括号，与 ratelimit TokenLimiter 的 "{keyPrefix}.tokens"（KEYS 须同
+	// slot（hash-tag））用法对齐。即便 KeyPrefix 自带 hash-tag（如 "{app}:"），
+	// 首个 {...} 仍落在本 tag 内，三键依旧同槽。
+	tagged := "{" + l.prefix + key + "}"
+	return []string{tagged, tagged + ":lock", tagged + ":seq"}
 }
 
 // validate 构造参数与运行条件的统一 fail-fast 校验。
