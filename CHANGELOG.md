@@ -1,3 +1,13 @@
+## [v0.12.0] — 2026-11-09
+
+- fix(distlock): Unlock 假成功回归钉（#115 已由 #117 修复）
+- fix(client): NewClient 不再原地改写调用方 UniversalOptions（#116）
+- feat(ratelimit): ResilientLimiter——Redis 固定窗口+本地桶降级，三态口径单源（#118）
+- fix(distlock): Lockout 三键 hash-tag——集群 CROSSSLOT 消除（#119）
+- feat(distlock/cache): per-instance logger 注入点 WithLogger/RedisConfig.Logger（#120）
+
+关联问题单：redisx#115、redisx#116、redisx#118、redisx#119、redisx#120。
+
 ## [v0.11.6] — 2026-11-08
 
 - fix(distlock): Unlock 丢弃解锁脚本返回值的「假成功」关闭——脚本返回值转显式语义（#115）。修复前 `unlockScript.Run` 的返回值被 `_` 丢弃：锁因 TTL 过期易主后，陈旧持有者的 Unlock 拿到脚本返回 0（非本人锁未删）而 err==nil ⇒ **调用方得到「解锁成功」**，与同文件 Renew（同一情形返回 `(false, nil)` 要求调用方「停止当前工作」）的显式契约自相矛盾，调用方在不知情下继续假装持有、与新持有者并发写临界区。修复后 Unlock 返回值三态：nil = 锁已删除；新增哨兵 `ErrLockNotHeld`（errors.Is 判定）= 锁不存在或已易主、本次未删任何锁；其它 = Redis 通信故障（可重试）——与 Renew 的 `(bool, error)` 显式契约对齐（接口签名不动：Locker.Unlock 仍返回 error，etcdx 等同形后端不受影响）。onUnlock 回调收到与返回值一致的 err。**续期 watchdog 时序同步修正**（issue 第二半）：删锁（网络）先行、watchdog 后停——修复前先 LoadAndDelete 杀 watchdog 再走网络删锁，删锁网络瞬断时「续期已停而锁还挂着」⇒ 锁将在 TTL 后静默失效，调用方拿到的却是可重试 error、误以为「还没解开所以还持有」继续用临界区；现在仅当删锁结果明确（成功/非本人）才清理状态，通信故障时 watchdog 继续续期兜底、锁不静默丢失。状态清理保持「LoadAndDelete + ownerID 比对 + LoadOrStore 回填」竞态安全口径，绝不误杀新持有者的续期。回归用例：TTL 过期易主后陈旧持有者解锁得 ErrLockNotHeld 且新持有者锁完好、错误 ownerID 解锁显式报错不再假成功、通信故障时续期状态与 watchdog 原样保留、onUnlock 回调语义；TestAutoRenew_MaxLifetimeExpiry 按新契约改判 ErrLockNotHeld
