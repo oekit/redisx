@@ -799,3 +799,57 @@ func TestCustomSerializer(t *testing.T) {
 		t.Errorf("expected user_name=test, got %v", m["user_name"])
 	}
 }
+
+// TestRedisCache_SetWithTTL_GuardAgainstZeroTTL 表驱动（#113）：ttl<=0 必须
+// fail-fast 返回错误、绝不落键——go-redis 对 TTL=0 不下发 EX ⇒ 此前静默写成
+// 永久键，与同结构体 Set 的「TTL=0 → 24h 缺省」构成两种相反语义。护栏对齐
+// 仓内 distlock/ratelimit 零值笔误 fail-fast 哲学。
+func TestRedisCache_SetWithTTL_GuardAgainstZeroTTL(t *testing.T) {
+	cases := []struct {
+		name string
+		ttl  time.Duration
+	}{
+		{"zero is permanent-key typo", 0},
+		{"negative is also invalid", -1 * time.Second},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			client, mr := newTestRedisClient(t)
+			rc := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "x:"})
+			ctx := context.Background()
+
+			err := rc.SetWithTTL(ctx, "k", &testUser{ID: 1, Name: "n"}, c.ttl)
+			if err == nil {
+				t.Fatalf("SetWithTTL(ttl=%s) 必须返回错误（#113）", c.ttl)
+			}
+			if !strings.Contains(err.Error(), "ttl") {
+				t.Fatalf("错误信息必须指明 ttl 非法，got: %v", err)
+			}
+			// 关键反断言：报错路径不得留下任何键（尤其不得是永久键）。
+			if mr.Exists("x:k") {
+				t.Fatalf("SetWithTTL(ttl=%s) 报错后不得落键（旧实现落永久键，#113）", c.ttl)
+			}
+			// 底层键也不得存在（带前缀的全键口径）。
+			if mr.Exists("x:k") {
+				t.Fatal("full key must not exist after guard error")
+			}
+		})
+	}
+}
+
+// TestRedisCache_SetWithTTL_PositiveTTLHasExpiry 钉住正 TTL 路径不受护栏影响：
+// 写入成功且键带过期时间（miniredis TTL > 0），不是永久键。
+func TestRedisCache_SetWithTTL_PositiveTTLHasExpiry(t *testing.T) {
+	client, mr := newTestRedisClient(t)
+	rc := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "x:"})
+	ctx := context.Background()
+
+	if err := rc.SetWithTTL(ctx, "k", &testUser{ID: 1, Name: "n"}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	ttl := mr.TTL("x:k")
+	if ttl <= 0 {
+		// miniredis 对无 TTL 键返回 0；正 TTL 写入必须带过期（绝不永久键，#113）。
+		t.Fatalf("positive TTL write must carry an expiry, got %s", ttl)
+	}
+}
