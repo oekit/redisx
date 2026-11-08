@@ -2,6 +2,7 @@ package distlock
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -70,9 +71,10 @@ func TestAutoRenew_MaxLifetimeExpiry(t *testing.T) {
 		t.Error("expected lock to expire after max auto-renew lifetime (renewal must stop)")
 	}
 
-	// 后续 Unlock 仍应安全（状态可清理，Lua 返回 0 不误删他人锁）
-	if uerr := l.Unlock(ctx, "m3-key", ownerID); uerr != nil {
-		t.Errorf("Unlock after expiry: %v", uerr)
+	// 后续 Unlock 仍应安全：锁已过期（Lua 返回 0）⇒ 显式 ErrLockNotHeld
+	//（#115，修复前脚本返回值被丢弃 ⇒ 假 nil），且不误删他人锁、状态可清理。
+	if uerr := l.Unlock(ctx, "m3-key", ownerID); !errors.Is(uerr, ErrLockNotHeld) {
+		t.Errorf("Unlock after expiry must report ErrLockNotHeld (#115), got %v", uerr)
 	}
 }
 

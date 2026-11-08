@@ -1,3 +1,9 @@
+## [v0.11.6] — 2026-11-08
+
+- fix(distlock): Unlock 丢弃解锁脚本返回值的「假成功」关闭——脚本返回值转显式语义（#115）。修复前 `unlockScript.Run` 的返回值被 `_` 丢弃：锁因 TTL 过期易主后，陈旧持有者的 Unlock 拿到脚本返回 0（非本人锁未删）而 err==nil ⇒ **调用方得到「解锁成功」**，与同文件 Renew（同一情形返回 `(false, nil)` 要求调用方「停止当前工作」）的显式契约自相矛盾，调用方在不知情下继续假装持有、与新持有者并发写临界区。修复后 Unlock 返回值三态：nil = 锁已删除；新增哨兵 `ErrLockNotHeld`（errors.Is 判定）= 锁不存在或已易主、本次未删任何锁；其它 = Redis 通信故障（可重试）——与 Renew 的 `(bool, error)` 显式契约对齐（接口签名不动：Locker.Unlock 仍返回 error，etcdx 等同形后端不受影响）。onUnlock 回调收到与返回值一致的 err。**续期 watchdog 时序同步修正**（issue 第二半）：删锁（网络）先行、watchdog 后停——修复前先 LoadAndDelete 杀 watchdog 再走网络删锁，删锁网络瞬断时「续期已停而锁还挂着」⇒ 锁将在 TTL 后静默失效，调用方拿到的却是可重试 error、误以为「还没解开所以还持有」继续用临界区；现在仅当删锁结果明确（成功/非本人）才清理状态，通信故障时 watchdog 继续续期兜底、锁不静默丢失。状态清理保持「LoadAndDelete + ownerID 比对 + LoadOrStore 回填」竞态安全口径，绝不误杀新持有者的续期。回归用例：TTL 过期易主后陈旧持有者解锁得 ErrLockNotHeld 且新持有者锁完好、错误 ownerID 解锁显式报错不再假成功、通信故障时续期状态与 watchdog 原样保留、onUnlock 回调语义；TestAutoRenew_MaxLifetimeExpiry 按新契约改判 ErrLockNotHeld
+
+关联问题单：redisx#115。
+
 ## [v0.11.5] — 2026-11-08
 
 - fix(bloom): NewBloomFilter 对 BF.RESERVE 错误不再按 "exists" 文本匹配吞错——改用 BF.INFO 探测区分「已存在」与「真失败」（#112）。修复前 `strings.Contains(err.Error(), "exists")` 会把任何恰好含该词的错误消息（代理/集群客户端的连接级文案如 "connection pool exhausted, no free conn exists"）误判成「已存在，复用」并静默返回过滤器句柄，后续 BF.ADD 打在不存在的过滤器上必然失败且错误点远离根因；反之 RedisBloom 各版本改措辞则合法创建被误报失败。修复后：RESERVE 报错 → BF.INFO 探测——INFO 成功 ⇒ 过滤器确实存在，照旧复用（语义不变，且与 RedisBloom 各版本错误措辞、miniredis 与真实 Redis 的错误形态无关）；INFO 也失败 ⇒ RESERVE 失败另有原因（连接故障/模块缺失等），原始错误包装上抛不吞。回归钉：SetError 注入含 "exists" 的连接级错误消息断言不再被吞（旧实现必红）+ 模块缺失形态错误上抛

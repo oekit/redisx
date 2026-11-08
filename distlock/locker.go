@@ -22,6 +22,14 @@ var ErrLockNotAcquired = errors.New("lock not acquired")
 // ErrLockTimeout 表示在指定超时时间内未能获取锁。
 var ErrLockTimeout = errors.New("lock acquire timeout")
 
+// ErrLockNotHeld 表示解锁时锁不存在或已易主——本次 Unlock **没有删除任何锁**
+// （#115）。典型成因：锁 TTL 过期后已被他人重新获取、或对同一 (key, ownerID)
+// 重复 Unlock。与 [Renew] 返回 (false, nil) 的「锁已丢失」语义对齐：调用方
+// 收到本哨兵即说明自己已不再持有锁，**不得继续在临界区内工作**（继续执行会
+// 与新持有者并发）；errors.Is 判定，与其它 Redis 错误（可重试的通信故障）
+// 区分。
+var ErrLockNotHeld = errors.New("lock not held by this owner")
+
 var unlockScript = redis.NewScript(`
 	if redis.call("get", KEYS[1]) == ARGV[1] then
 		return redis.call("del", KEYS[1])
@@ -116,6 +124,8 @@ func WithOnLock(fn func(key string, acquired bool, err error)) RedisLockerOption
 }
 
 // WithOnUnlock 设置解锁事件回调。
+// err 语义与 Unlock 返回值一致（#115）：nil = 锁已删除；ErrLockNotHeld =
+// 锁不存在或已易主（陈旧持有者，未删任何锁）；其它 = Redis 通信故障。
 // 用于日志记录和监控。
 func WithOnUnlock(fn func(key string, err error)) RedisLockerOption {
 	return func(l *RedisLocker) { l.onUnlock = fn }
@@ -229,11 +239,69 @@ func (l *RedisLocker) TryLock(ctx context.Context, key string, ttl time.Duration
 // Unlock 释放分布式锁（Lua 原子操作，只有锁的持有者才能释放）。
 // ownerID 是 TryLock/Lock 返回的值。
 //
-// 续期状态的清理采用"先 LoadAndDelete 再比对 ownerID"的顺序，
-// 消除 Load→比对→LoadAndDelete 窗口内的竞态：锁超时易主后，陈旧持有者的
-// Unlock 不会误删/误杀新持有者的续期状态（ownerID 不匹配时原样回填，
-// 回填用 LoadOrStore 保证不覆盖窗口期新存入的第三个状态）。
+// 返回值语义（#115，显式化）：
+//   - nil：锁已被本人成功删除；
+//   - [ErrLockNotHeld]：锁不存在或已易主，本次 Unlock 没有删除任何锁——
+//     TTL 过期易主后陈旧持有者的解锁不再「假成功」（脚本返回 0 被丢弃、
+//     err==nil 的旧口径与 Renew 的「锁已丢失」显式契约自相矛盾，也让调用方
+//     在不知情下继续假装持有）；errors.Is 判定；
+//   - 其它 error：Redis 通信故障（可重试，与 Renew 的 error 语义对齐）。
+//
+// 续期 watchdog 的时序（#115 第二半）：删锁（网络）先行、watchdog 后停——
+// 修复前先 LoadAndDelete 杀 watchdog 再走网络删锁，删锁网络瞬断时
+// 「续期已停而锁还挂着」⇒ 锁将在 TTL 后静默失效，调用方却拿到可重试 error
+// 误以为还在持有。现在仅当删锁结果明确（成功或非本人）才清理状态；
+// 通信故障时 watchdog 继续续期，锁不静默丢失。
+//
+// 状态清理仍用"LoadAndDelete 再比对 ownerID"消除竞态：ownerID 不匹配时
+// 原样回填（LoadOrStore 保证不覆盖窗口期新存入的第三个状态），绝不误杀
+// 新持有者的续期。
 func (l *RedisLocker) Unlock(ctx context.Context, key string, ownerID string) error {
+	// graceful 降级模式没有真锁可删：只做状态机对称清理（watchdog 注册了
+	// 但无 goroutine），与旧行为一致。
+	if l.client == nil && l.gracefulDegradation {
+		l.stopRenewState(key, ownerID)
+		return nil
+	}
+	// 非法组合 fail-fast：nil client 且未开优雅降级时，缺这一检查会让
+	// unlockScript.Run 在 nil interface 上调用 ⇒ 运行时 nil 指针 panic
+	// （TryLock/Renew 都有对称检查，Unlock 此前漏了）。
+	if l.client == nil {
+		return fmt.Errorf("distlock: redis client is nil (construct with a client or enable WithGracefulDegradation)")
+	}
+
+	// 删锁先行（#115）：拿到脚本结果前不碰 watchdog 状态。
+	result, err := unlockScript.Run(ctx, l.client, []string{l.lockKey(key)}, ownerID).Int()
+	if err != nil {
+		// 通信故障：锁可能仍在，watchdog 不停（继续续期兜底），状态原样保留。
+		werr := fmt.Errorf("redis unlock failed: %w", err)
+		if l.onUnlock != nil {
+			l.onUnlock(key, werr)
+		}
+		return werr
+	}
+	// 脚本返回 0：锁不存在或非本人（TTL 过期易主/重复解锁）——显式哨兵，
+	// 不再「假成功」。
+	if result == 0 {
+		l.stopRenewState(key, ownerID)
+		if l.onUnlock != nil {
+			l.onUnlock(key, ErrLockNotHeld)
+		}
+		return ErrLockNotHeld
+	}
+
+	// 删锁成功，停掉本人的续期状态。
+	l.stopRenewState(key, ownerID)
+	if l.onUnlock != nil {
+		l.onUnlock(key, nil)
+	}
+	return nil
+}
+
+// stopRenewState 清理 key 对应的续期状态：只停/只删属于 ownerID 的状态；
+// 属于他人（锁易主后新持有者）的状态原样回填，绝不误杀。LoadOrStore 回填
+// 保证不覆盖窗口期新存入的第三个状态。
+func (l *RedisLocker) stopRenewState(key string, ownerID string) {
 	if v, ok := l.locks.LoadAndDelete(key); ok {
 		cur := v.(*lockState)
 		if cur.ownerID == ownerID {
@@ -244,29 +312,9 @@ func (l *RedisLocker) Unlock(ctx context.Context, key string, ownerID string) er
 				close(cur.stopChan)
 			})
 		} else {
-			// 陈旧持有者解锁新持有者的锁：回填新持有者的状态。
-			// LoadOrStore：若窗口期已有第三个状态存入（他人重新获锁），
-			// 保留第三个状态，丢弃我们删除的这份（其续期由自身生命周期
-			// 或持有者后续 Unlock 兜底，绝不误杀在持续期）。
 			l.locks.LoadOrStore(key, cur)
 		}
 	}
-
-	if l.client == nil && l.gracefulDegradation {
-		return nil
-	}
-	// 非法组合 fail-fast：nil client 且未开优雅降级时，缺这一检查会让
-	// unlockScript.Run 在 nil interface 上调用 ⇒ 运行时 nil 指针 panic
-	// （TryLock/Renew 都有对称检查，Unlock 此前漏了）。
-	if l.client == nil {
-		return fmt.Errorf("distlock: redis client is nil (construct with a client or enable WithGracefulDegradation)")
-	}
-
-	_, err := unlockScript.Run(ctx, l.client, []string{l.lockKey(key)}, ownerID).Result()
-	if l.onUnlock != nil {
-		l.onUnlock(key, err)
-	}
-	return err
 }
 
 // Renew 手动续期：原子 check-and-renew（Lua CAS，GET==ownerID → PEXPIRE），

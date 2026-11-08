@@ -118,15 +118,136 @@ func TestUnlock_WrongOwner(t *testing.T) {
 	}
 
 	// 用错 ownerID 解锁：Lua 脚本比较 ARGV[1] != current value，
-	// 不调用 DEL，返 0。go-redis 把 0 当 Result() 成功（nil error），
-	// key 仍存在。
+	// 不调用 DEL，返 0 ⇒ 显式 ErrLockNotHeld（#115，修复前脚本返回值被
+	// 丢弃、err==nil 的「假成功」）。key 仍存在。
 	err = l.Unlock(ctx, "k1", "wrong-owner")
-	if err != nil {
-		t.Errorf("unexpected error from unlock script: %v", err)
+	if !errors.Is(err, ErrLockNotHeld) {
+		t.Errorf("expected ErrLockNotHeld, got %v", err)
 	}
-	// 验证 key 仍存在（Lua 没删）
 	if !mr.Exists("lock:k1") {
 		t.Error("expected lock:k1 to still exist after wrong-owner Unlock")
+	}
+}
+
+// TestUnlock_NotHeldKeepsNewHolderLock 是 #115 的核心回归：锁 TTL 过期易主
+// 后，陈旧持有者的 Unlock 必须得到 ErrLockNotHeld（修复前：脚本返回 0 被
+// 丢弃 ⇒ err==nil「假成功」，调用方在不知情下继续假装持有，与新持有者并发），
+// 且新持有者的锁完好、仍能正常解锁。
+func TestUnlock_NotHeldKeepsNewHolderLock(t *testing.T) {
+	l, mr := newTestLocker(t)
+	mr.ClockTTL(true) // TTL 随真实时钟递减（短 TTL 过期场景必需）
+	ctx := context.Background()
+
+	staleOwner, err := l.TryLock(ctx, "k1", 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 等 TTL 过期（watchdog 未启用，无续期），新持有者获锁。
+	time.Sleep(120 * time.Millisecond)
+	newOwner, err := l.TryLock(ctx, "k1", time.Minute)
+	if err != nil {
+		t.Fatalf("new owner failed to acquire after TTL expiry: %v", err)
+	}
+	if newOwner == staleOwner {
+		t.Fatal("new ownerID must differ from stale one")
+	}
+
+	// 陈旧持有者解锁：显式 ErrLockNotHeld，且新持有者的锁不受影响。
+	if err := l.Unlock(ctx, "k1", staleOwner); !errors.Is(err, ErrLockNotHeld) {
+		t.Fatalf("stale holder unlock must return ErrLockNotHeld, got %v", err)
+	}
+	if !mr.Exists("lock:k1") {
+		t.Fatal("new holder's lock must survive stale unlock")
+	}
+	got, err := mr.Get("lock:k1")
+	if err != nil {
+		t.Fatalf("miniredis get: %v", err)
+	}
+	if got != newOwner {
+		t.Fatalf("lock value changed after stale unlock: got %q, want %q", got, newOwner)
+	}
+	if err := l.Unlock(ctx, "k1", newOwner); err != nil {
+		t.Fatalf("new owner unlock failed: %v", err)
+	}
+	if mr.Exists("lock:k1") {
+		t.Error("lock should be deleted by new owner unlock")
+	}
+}
+
+// TestUnlock_CommErrorKeepsAutoRenew 是 #115 第二半的回归：Unlock 的删锁
+// 请求通信故障时，autoRenew watchdog 必须保持运行、续期状态原样保留——
+// 修复前 watchdog 在网络请求之前就被杀掉，删锁失败 ⇒ 续期已停而锁还挂着
+// ⇒ 锁在 TTL 后静默失效，调用方却以为「还没解开所以还持有」。
+func TestUnlock_CommErrorKeepsAutoRenew(t *testing.T) {
+	_, mr := newTestLocker(t)
+	// 显式续期间隔远大于测试窗口 ⇒ 断言期间不发生续期写动作，只看状态。
+	rl := NewRedisLocker(func() redis.UniversalClient {
+		c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		t.Cleanup(func() { _ = c.Close() })
+		return c
+	}(), WithAutoRenew(), WithRenewInterval(time.Hour))
+
+	ctx := context.Background()
+	ownerID, err := rl.TryLock(ctx, "k1", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 杀掉 miniredis ⇒ 删锁请求通信故障。
+	mr.Close()
+	err = rl.Unlock(ctx, "k1", ownerID)
+	if err == nil || errors.Is(err, ErrLockNotHeld) {
+		t.Fatalf("expected comm error (not ErrLockNotHeld/nil), got %v", err)
+	}
+
+	// watchdog 状态必须原样保留（未停、未删）。
+	v, ok := rl.locks.Load("k1")
+	if !ok {
+		t.Fatal("renew state was dropped on comm failure (#115): lock will silently expire after TTL")
+	}
+	st := v.(*lockState)
+	select {
+	case <-st.stopChan:
+		t.Fatal("watchdog was stopped before/at failed unlock (#115): renewal stopped while lock may still be held")
+	default:
+	}
+
+	// 清理：显式停掉 watchdog（本测试的续期间隔 1h，miniredis 已关，
+	// 不清理会泄漏 goroutine 并污染后续 goroutine 计数类用例的基线）。
+	rl.stopRenewState("k1", ownerID)
+	waitForNoAutoRenewGoroutines(t)
+}
+
+// waitForNoAutoRenewGoroutines 等待 startAutoRenew 派生的 goroutine 全部退出。
+func waitForNoAutoRenewGoroutines(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if countAutoRenewGoroutines() == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestUnlock_OnUnlockCallback_ReportsNotHeld onUnlock 回调的错误语义与
+// Unlock 返回值一致（#115）：非本人解锁回调收到 ErrLockNotHeld。
+func TestUnlock_OnUnlockCallback_ReportsNotHeld(t *testing.T) {
+	l, _ := newTestLocker(t)
+	ctx := context.Background()
+
+	var gotErr error
+	l.onUnlock = func(key string, err error) {
+		gotErr = err
+	}
+
+	_, _ = l.TryLock(ctx, "k1", time.Minute)
+	if err := l.Unlock(ctx, "k1", "wrong-owner"); !errors.Is(err, ErrLockNotHeld) {
+		t.Fatalf("unlock: %v", err)
+	}
+	if !errors.Is(gotErr, ErrLockNotHeld) {
+		t.Errorf("onUnlock must receive ErrLockNotHeld, got %v", gotErr)
 	}
 }
 
