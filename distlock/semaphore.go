@@ -137,7 +137,8 @@ func (s *Semaphore) Renew(ctx context.Context, identifier string) (bool, error) 
 }
 
 // Release 释放 identifier 持有的槽，幂等：未持有（已过期回收/重复释放）
-// 也返回 nil，与 Locker.Unlock 的宽松口径一致。
+// 也返回 nil（槽位语义天然幂等，与 Locker.Unlock 的显式 ErrLockNotHeld
+// 契约有意不同，#115）。
 func (s *Semaphore) Release(ctx context.Context, identifier string) error {
 	if identifier == "" {
 		return fmt.Errorf("distlock: semaphore identifier must not be empty")

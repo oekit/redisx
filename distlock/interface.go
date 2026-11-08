@@ -19,5 +19,7 @@ type Locker interface {
 	Lock(ctx context.Context, key string, ttl time.Duration, timeout time.Duration) (string, error)
 
 	// Unlock 释放锁，ownerID 必须匹配。
+	// 返回 nil 表示锁已删除；锁不存在或已易主（陈旧持有者解锁）返回
+	// ErrLockNotHeld（调用方不得继续假装持有）；其它 error 为后端通信故障。
 	Unlock(ctx context.Context, key string, ownerID string) error
 }
