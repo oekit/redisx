@@ -506,3 +506,23 @@ func TestTryLock_NilClientWithoutDegradation(t *testing.T) {
 		t.Error("nil client without graceful degradation must fail fast, not panic")
 	}
 }
+
+// TestUnlock_DoubleUnlock_SecondReportsNotHeld 是 #115 的补充回归钉
+// （#115 已修复于 main，PR #117；本测试钉住 ErrLockNotHeld 文档里显式列出
+// 的「对同一 (key, ownerID) 重复 Unlock」子情形）：第二次 Unlock 不得
+// 假成功——脚本返回 0 必须转显式哨兵。
+func TestUnlock_DoubleUnlock_SecondReportsNotHeld(t *testing.T) {
+	l, _ := newTestLocker(t)
+	ctx := context.Background()
+
+	ownerID, err := l.TryLock(ctx, "k1", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Unlock(ctx, "k1", ownerID); err != nil {
+		t.Fatalf("first unlock: %v", err)
+	}
+	if err := l.Unlock(ctx, "k1", ownerID); !errors.Is(err, ErrLockNotHeld) {
+		t.Fatalf("second unlock must report ErrLockNotHeld (#115), got %v", err)
+	}
+}
