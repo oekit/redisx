@@ -1,3 +1,10 @@
+## [v0.11.5] — 2026-11-08
+
+- fix(bloom): NewBloomFilter 对 BF.RESERVE 错误不再按 "exists" 文本匹配吞错——改用 BF.INFO 探测区分「已存在」与「真失败」（#112）。修复前 `strings.Contains(err.Error(), "exists")` 会把任何恰好含该词的错误消息（代理/集群客户端的连接级文案如 "connection pool exhausted, no free conn exists"）误判成「已存在，复用」并静默返回过滤器句柄，后续 BF.ADD 打在不存在的过滤器上必然失败且错误点远离根因；反之 RedisBloom 各版本改措辞则合法创建被误报失败。修复后：RESERVE 报错 → BF.INFO 探测——INFO 成功 ⇒ 过滤器确实存在，照旧复用（语义不变，且与 RedisBloom 各版本错误措辞、miniredis 与真实 Redis 的错误形态无关）；INFO 也失败 ⇒ RESERVE 失败另有原因（连接故障/模块缺失等），原始错误包装上抛不吞。回归钉：SetError 注入含 "exists" 的连接级错误消息断言不再被吞（旧实现必红）+ 模块缺失形态错误上抛
+- fix(cache): RedisCache.SetWithTTL 对 ttl<=0 fail-fast 返回错误，不再静默写永久键（#113）——go-redis 对 TTL=0 不下发 EX ⇒ 旧实现直接透传 ttl=0 写出**永不过期键**，与同结构体 Set 的「TTL=0 → 24h 缺省」在同一类型上构成两种相反语义（零值笔误：漏传时长/时长变量未初始化），且经 twolevel.SetWithTTL 双层转发时 L1/L2 同时放大。对齐仓内护栏哲学（distlock Renew TTL 下限、ratelimit NewPeriodLimit quota<=0 fail-fast、#92 同族）：显式自定义 TTL 却 <=0 视为调用方 bug，响亮拒绝，不猜缺省也不落键（错误路径零写入）。Set 的 24h 缺省口径不变；twolevel 侧的同步护栏属 data 仓（L2 先写序下本修复已阻断放大链路），随 data 下一版跟进
+
+关联问题单：redisx#112、redisx#113。
+
 ## [v0.11.4] — 2026-11-08
 
 - build: 依赖地板对齐——本版把 oekit 依赖地板抬到各依赖当前最新已发布版本（matrix-tools/scripts/align_floors.py 维护轮）

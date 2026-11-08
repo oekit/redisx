@@ -220,7 +220,17 @@ func (c *RedisCache[T]) Set(ctx context.Context, key string, value *T) error {
 }
 
 // SetWithTTL 设置缓存（自定义 TTL）。
+//
+// ttl 必须 > 0，<=0 返回错误（#113）：go-redis 对 TTL=0 不下发 EX ⇒ 写出
+// **永久键**——与本类型 Set 的「TTL=0 → 24h 缺省」口径在同一结构体上构成
+// 两种相反语义，零值笔误（漏传时长/时长变量未初始化）会静默落成不过期键，
+// 且经 twolevel.SetWithTTL 双层转发时 L1/L2 同时放大。对齐仓内护栏哲学
+// （distlock/ratelimit 对同类零值笔误 fail-fast）：显式自定义 TTL 却 <=0 视为
+// 调用方 bug，响亮拒绝，不猜缺省也不写永久键。
 func (c *RedisCache[T]) SetWithTTL(ctx context.Context, key string, value *T, ttl time.Duration) error {
+	if ttl <= 0 {
+		return fmt.Errorf("cache SetWithTTL: ttl 必须 > 0（得到 %s）——0 会经 go-redis 写成永久键，与 Set 的 24h 缺省口径冲突（#113）", ttl)
+	}
 	fullKey := c.fullKey(key)
 
 	data, err := c.cfg.Serializer(value)

@@ -3,7 +3,6 @@ package redisx
 import (
 	"context"
 	"fmt"
-	"strings"
 )
 
 // BloomFilter 是基于 RedisBloom 的布隆过滤器封装。
@@ -20,6 +19,13 @@ type BloomFilter struct {
 // 本次传入的参数不生效（Redis 的 BF.RESERVE 对已存在的 key 不覆盖）。
 // 需要按新参数重建，请先 DEL 该 key。
 //
+// 「已存在」的判定**不做错误文本匹配**（#112）：任何含 "exists" 的错误消息
+// （连接/代理/集群客户端的错误文案恰好带该词）此前都会被误判成「已存在，复用」，
+// 后续 BF.ADD 打在不存在的过滤器上必然失败且错误点远离根因。RESERVE 报错后
+// 改用 BF.INFO 探测区分——过滤器确实存在时 INFO 必成功（与 RedisBloom 各版本
+// 的措辞无关，miniredis 与真实 Redis 通吃）；INFO 也失败则 RESERVE 的失败另有
+// 原因（连接故障/模块缺失等），原始错误上抛不吞。
+//
 // 参数:
 //   - ctx: 上下文（支持超时/取消）
 //   - key: 布隆过滤器的 key 名
@@ -31,13 +37,13 @@ func (c *Client) NewBloomFilter(ctx context.Context, key string, errorRate float
 		key:    key,
 	}
 
-	// 尝试创建布隆过滤器（已存在时会返回错误，可忽略）
+	// 尝试创建布隆过滤器；报错时经 BF.INFO 探测区分「已存在」与「真失败」（#112）
 	err := c.client.Do(ctx, "BF.RESERVE", c.convertKey(key), errorRate, capacity).Err()
 	if err != nil {
-		// 如果是已存在的错误，忽略（使用 Contains 兼容不同 Redis 版本的错误消息）
-		if !strings.Contains(err.Error(), "exists") {
+		if infoErr := c.client.Do(ctx, "BF.INFO", c.convertKey(key)).Err(); infoErr != nil {
 			return nil, fmt.Errorf("create bloom filter: %w", err)
 		}
+		// INFO 成功 ⇒ 过滤器确实已存在：复用既有实例（参数以既有为准，见 godoc）
 	}
 
 	return bf, nil
