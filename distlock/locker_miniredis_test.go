@@ -154,8 +154,8 @@ func TestUnlock_NotHeldKeepsNewHolderLock(t *testing.T) {
 	}
 
 	// 陈旧持有者解锁：显式 ErrLockNotHeld，且新持有者的锁不受影响。
-	if err := l.Unlock(ctx, "k1", staleOwner); !errors.Is(err, ErrLockNotHeld) {
-		t.Fatalf("stale holder unlock must return ErrLockNotHeld, got %v", err)
+	if uerr := l.Unlock(ctx, "k1", staleOwner); !errors.Is(uerr, ErrLockNotHeld) {
+		t.Fatalf("stale holder unlock must return ErrLockNotHeld, got %v", uerr)
 	}
 	if !mr.Exists("lock:k1") {
 		t.Fatal("new holder's lock must survive stale unlock")
