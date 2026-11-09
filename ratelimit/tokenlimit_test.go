@@ -157,7 +157,16 @@ func TestTokenLimiter_BurstConsume(t *testing.T) {
 			t.Fatalf("allow %d: expected true within burst", i+1)
 		}
 	}
-	// 超出 burst 拒绝（Lua false → redis.Nil）
+	// 超出 burst 拒绝（Lua false → redis.Nil）。
+	//
+	// 脚本的时间粒度是秒（ARGV[3] = time.Now().Unix()）：耗尽与拒绝判定若
+	// 恰好跨过自然秒边界，delta=1 会凭空回补 2 个令牌，第 4 发被误放行
+	// （整包 -race 负载下实测录得）。与 Refill_BackdatedTimestamp 的注时
+	// 手法对称——把 ts 拨到下一秒，强制本次判定的 delta=0（无回补），拒绝
+	// 语义变成确定性的，不依赖判定落在同一秒内。
+	if err := mr.Set("{b1}.ts", strconv.FormatInt(time.Now().Unix()+1, 10)); err != nil {
+		t.Fatal(err)
+	}
 	if l.Allow(ctx) {
 		t.Fatal("expected false beyond burst")
 	}

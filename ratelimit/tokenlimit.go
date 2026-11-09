@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"strconv"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -17,6 +15,7 @@ import (
 //
 // 可选进程内兜底（WithTokenFallback）：Redis 故障时降级到本地 golang.org/x/time/rate
 // 桶（同 rate/burst），后台周期探活成功后自动回切；未开启兜底时故障一律拒绝。
+// 探活/回切/幂等防重拉机制与 PeriodLimit 的 rescue（#125）同源（redisMonitor）。
 //
 // 面向"超出速率即丢弃"的场景（限流降级）；需要排队/等待请用 golang.org/x/time/rate
 // 的 Reserve/Wait，本包不提供。
@@ -28,16 +27,13 @@ type TokenLimiter struct {
 	tokenKey     string // "{keyPrefix}.tokens"
 	timestampKey string // "{keyPrefix}.ts"
 
-	// 兜底配置
+	// 兜底开关 + 探活降级机制（pingInterval/probeTimeout/redisAlive/
+	// startMonitor 经嵌入字段透出，WithTokenPingInterval/WithTokenProbeTimeout
+	// 直写透出字段）。
 	fallbackEnabled bool
-	pingInterval    time.Duration // 探活间隔
-	probeTimeout    time.Duration // 单次探活超时（与间隔解耦）
+	*redisMonitor
 
-	// 兜底运行态：redisAlive 无锁读（热路径），monitorStarted 仅在锁内迁移
-	rescueLock     sync.Mutex
-	redisAlive     atomic.Bool
-	monitorStarted bool
-	rescueLimiter  *xrate.Limiter
+	rescueLimiter *xrate.Limiter
 }
 
 // TokenOption 配置 TokenLimiter 的可选参数。
@@ -97,11 +93,9 @@ func NewTokenLimiter(rate, burst int, store redis.Scripter, keyPrefix string, op
 		store:         store,
 		tokenKey:      "{" + keyPrefix + "}.tokens",
 		timestampKey:  "{" + keyPrefix + "}.ts",
-		pingInterval:  defaultPingInterval,
-		probeTimeout:  defaultProbeTimeout,
+		redisMonitor:  newRedisMonitor(store),
 		rescueLimiter: newRescueLimiter(rate, burst),
 	}
-	l.redisAlive.Store(true)
 	for _, opt := range opts {
 		opt(l)
 	}

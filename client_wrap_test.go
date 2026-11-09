@@ -107,3 +107,29 @@ func TestNewClient_ExplicitFieldsPreserved(t *testing.T) {
 		t.Fatalf("显式字段不得被覆盖，也不得被改写，实际: %+v", opt)
 	}
 }
+
+// TestNewClient_NilOptionsReturnsError 回归（#129）：NewClient(nil) 必须
+// fail-fast 返回 error 而非 nil 指针 panic——签名已预留 error 返回通道，
+// 调用方参数错误应可被程序化处理（与 etcdx 的同族构造口径一致），构造期
+// 直接解引用会把「配置为 nil」升级成进程崩溃。
+func TestNewClient_NilOptionsReturnsError(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("NewClient(nil) must return an error, not panic: %v", r)
+		}
+	}()
+
+	c, err := NewClient(nil)
+	if err == nil {
+		if c != nil {
+			_ = c.Close()
+		}
+		t.Fatal("NewClient(nil) must return a non-nil error")
+	}
+	if c != nil {
+		t.Fatal("NewClient(nil) must return a nil client alongside the error")
+	}
+	if want := "redisx: options are nil"; err.Error() != want {
+		t.Fatalf("error = %q, want %q", err.Error(), want)
+	}
+}
