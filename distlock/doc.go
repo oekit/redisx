@@ -11,12 +11,17 @@
 //   - 可选自动续期（WithAutoRenew，TryLock/Lock 对称生效，含最大生命周期
 //     安全网）与手动续期（RedisLocker.Renew，Lua CAS 毫秒精度）
 //   - Semaphore 分布式信号量——ZSET 槽位配额（同一时刻 N 个持有者），
-//     持有者崩溃后槽位 slotTTL 过期自愈
+//     持有者崩溃后槽位 slotTTL 过期自愈；可选自动续期 watchdog
+//     （WithSemaphoreAutoRenew，#126，与 Lock 的续期家族同构：间隔缺省
+//     slotTTL/2、MaxAutoRenew 安全网、Release 即停）
+//   - BruteForceGuard 防爆破锁对组合口（#128）：分布式 Lockout + 进程内
+//     降级实现（concurrency/ratelimit.Lockout）+ Redis 故障时的双实现
+//     路由，阈值/窗口/锁定时长库内同源，Fail/Check/Reset 对外统一
 //   - 便捷包装 WithLock（加锁→执行→自动释放）
 //   - 可选无 Redis 时降级放行（单实例部署场景）
-//   - 可选 per-instance 日志注入（WithLogger，#120）：watchdog 告警只进
-//     注入的 logger；缺省实例私有的 logx.Delegating("distlock")，与历史
-//     行为一致
+//   - 可选 per-instance 日志注入（WithLogger / WithSemaphoreLogger，#120）：
+//     watchdog 告警只进注入的 logger；缺省实例私有的 logx.Delegating("distlock")，
+//     与历史行为一致
 //   - 支持 redis.UniversalClient（兼容单机、集群、哨兵模式）；Lockout
 //     三键共享 hash-tag，集群上 Lua 多键访问合法（#119）
 //
@@ -117,19 +122,50 @@
 // 场景五：全局并发上限（Semaphore 分布式信号量）
 //
 // 多实例共享「同一时刻最多 N 个」的配额，崩溃持有者的槽位在 slotTTL 后
-// 自动回收：
+// 自动回收。长任务（克隆+推送之类可跑几十分钟）开启自动续期 watchdog
+// （#126，与 Lock 的 WithAutoRenew 家族同构——不再需要下游手拼 watchdog）：
 //
-//	sem := distlock.NewSemaphore(redisClient, "quota:git-sync", 4, 30*time.Second)
+//	sem := distlock.NewSemaphore(redisClient, "quota:git-sync", 4, 30*time.Second,
+//	    distlock.WithSemaphoreAutoRenew(),
+//	    distlock.WithSemaphoreMaxAutoRenew(-1), // 数小时长任务：取消 10×slotTTL 上限
+//	)
 //	id := instanceID + ":" + taskID
 //	ok, err := sem.Acquire(ctx, id) // false = 配额已满
 //	if err != nil || !ok {
 //	    return ErrTooBusy
 //	}
-//	defer sem.Release(ctx, id)
-//	// 长任务期间周期续期保槽：
+//	defer sem.Release(ctx, id) // watchdog 随 Release 停止
+//
+// 或自管 watchdog 显式续期（不受 WithSemaphoreMaxAutoRenew 约束）：
+//
 //	if ok, err := sem.Renew(ctx, id); err == nil && !ok {
-//	    return ErrSlotLost // 槽已过期回收，重新 Acquire
+//	    return ErrSlotLost // 槽已过期回收/配额被接管，重新 Acquire
 //	}
+//
+// 场景六：登录防爆破（BruteForceGuard 防爆破锁对，#128）
+//
+// 分布式 Lockout（跨实例共享计数）+ 进程内降级实现的一等组合口，阈值/
+// 窗口/锁定时长库内同源，Redis 故障时（MemFallback 打开）自动路由进程内
+// 实现——装配知识单源，下游不再整包手搓：
+//
+//	guard := distlock.NewBruteForceGuard(redisClient, distlock.GuardConfig{
+//	    KeyPrefix:   "zeus:lockout:",
+//	    MaxFails:    5,
+//	    Window:      10 * time.Minute,
+//	    LockTTL:     15 * time.Minute,
+//	    MemFallback: true, // Redis 故障降级到进程内 Lockout（单实例有界）
+//	})
+//	if locked, _ := guard.Check(ctx, "user:42"); locked {
+//	    return ErrTooManyAttempts // 429，余量经 guard.Check 查询
+//	}
+//	if err := verifyCredential(); err != nil {
+//	    locked, _ := guard.Fail(ctx, "user:42")
+//	    if locked {
+//	        return ErrTooManyAttempts
+//	    }
+//	    return err
+//	}
+//	_ = guard.Reset(ctx, "user:42") // 登录成功解封（幂等）
 //
 // # 错误处理
 //
