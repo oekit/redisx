@@ -1,3 +1,13 @@
+## [v0.13.0] — 2026-11-10
+
+- - feat(ratelimit): PeriodLimit 补 rescue 降级三档（Off/FailOpen/BoundedLocal）+ WithRescueBucket 每 key 缓存降级桶，探活回切与 TokenLimiter 单源（#125）
+- - feat(distlock): Semaphore 补 WithSemaphoreAutoRenew 自动续期家族——间隔缺省 slotTTL/2、MaxAutoRenew 安全网、Release 先停 watchdog（#126）
+- - fix(ratelimit): ResilientLimiter local 工厂内置 per-key 缓存，每 key 真正只调一次，文档改写一致（#127）
+- - feat(distlock): NewBruteForceGuard 防爆破锁对一等组合口——分布式+进程内双实现同阈值，Redis 故障自动路由 MemFallback（#128）
+- - fix: NewClient(nil) 构造期 fail-fast 返回 error，不再 nil 指针 panic（#129）
+
+关联问题单：redisx#125、redisx#126、redisx#127、redisx#128、redisx#129。
+
 ## [v0.12.0] — 2026-11-09
 
 - fix(distlock): Unlock 假成功回归钉（#115 已由 #117 修复）
