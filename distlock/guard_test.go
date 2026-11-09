@@ -44,8 +44,8 @@ func TestBruteForceGuard_RedisPath_TripsAndResets(t *testing.T) {
 		t.Fatalf("below threshold Check = (%v, %v, %v), want unlocked", locked, remain, err)
 	}
 
-	if locked, err := g.Fail(ctx, "user:42"); err != nil || !locked {
-		t.Fatalf("trip fail = (%v, %v), want (true, nil)", locked, err)
+	if tripLocked, err := g.Fail(ctx, "user:42"); err != nil || !tripLocked {
+		t.Fatalf("trip fail = (%v, %v), want (true, nil)", tripLocked, err)
 	}
 	locked, remain, err = g.Check(ctx, "user:42")
 	if err != nil || !locked {

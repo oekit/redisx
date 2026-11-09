@@ -359,7 +359,7 @@ func (s *Semaphore) startAutoRenew(identifier string) {
 				if !ok {
 					// Renew 返回 (false, nil)：槽位已丢失（过期回收/已被 Release/
 					// 配额被他人接管）——显式告警后退出。继续执行会超出配额
-					//（「以为自己还占着配额」是静默脑裂形态，#126），调用方
+					// （「以为自己还占着配额」是静默脑裂形态，#126），调用方
 					// 应重新 Acquire。
 					s.logr().Warn("auto renew failed: semaphore slot lost or recycled",
 						"key", s.key, "identifier", identifier)
