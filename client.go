@@ -2,6 +2,7 @@ package redisx
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -29,6 +30,11 @@ func WithPrefix(prefix string) RedisClientOptionFunc {
 
 // NewClient 从 UniversalOptions 创建 Redis 客户端。
 //
+// opt 为 nil 属调用方参数错误，构造期 fail-fast 返回 error（#129）——
+// 函数签名预留了 error 返回通道，nil 入参不应升级成进程崩溃（构造期直接
+// 解引用会 nil 指针 panic，调用方拿不到任何可处理的错误）。与 etcdx 的
+// 同族构造口径一致（etcdx.NewClient(nil) 同样返回 error 而非 panic）。
+//
 // opt 不会被改写（#116）：入口先 shallow-copy 再填缺省值——调用方复用同一
 // opt 构建第二个实例（同配置双实例/测试矩阵常见）时，不会拿到被第一次调用
 // 污染过的配置（否则「调用方显式设置的字段不覆盖」的判定基线已变，比如
@@ -42,6 +48,10 @@ func WithPrefix(prefix string) RedisClientOptionFunc {
 //	c, _ := redisx.NewClient(opt)
 //	_ = redisotel.InstrumentTracing(c.Client()) // github.com/oekit/tracing/redisotel
 func NewClient(opt *redis.UniversalOptions, opts ...RedisClientOptionFunc) (*Client, error) {
+	if opt == nil {
+		return nil, fmt.Errorf("redisx: options are nil")
+	}
+
 	o := &RedisClientOption{}
 	for _, fn := range opts {
 		fn(o)
