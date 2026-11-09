@@ -2,6 +2,7 @@ package ratelimit
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -112,7 +113,7 @@ func WithFallbackMetrics(fn func(Source)) ResilientOption {
 // 判定顺序：每次 Allow 都先尝试 Redis（无探活后台 goroutine），故障才降级
 // ⇒ Redis 恢复后下一次调用自动切回 SourceRedis，不会永久钉在本地兜底
 // （故障期间每次请求多付一次失败的往返，由调用方 ctx 超时兜底）。
-// ResilientLimiter 构造后字段不再变更，可并发使用。
+// 降级桶由库层按 key 缓存（#127：工厂对每个 key 真正只调一次），可并发使用。
 type ResilientLimiter struct {
 	dist  *PeriodLimit
 	local func(key string) LocalLimiter
@@ -120,14 +121,21 @@ type ResilientLimiter struct {
 	failMode FailMode
 	// onFallback 经 WithFallbackMetrics 写入，判定路径只读。
 	onFallback func(Source)
+	// localCache 是 per-key 兜底桶缓存（#127）：key → LocalLimiter。判定路径
+	// 并发读写，sync.Map 保证「每个 key 只建一个桶、工厂只调一次」——否则
+	// Redis 故障期间每次判定都拿全新满桶，本地限流静默失效。
+	localCache sync.Map
 }
 
 // NewResilientLimiter 创建组合限流器。
 //
 // dist 为 Redis 侧判定（必填；nil 属编程错误，直接 panic——静默 nil 会让
 // 每次判定都走降级路径，限流形同虚设且无报错）；local 为本地兜底桶工厂
-// （可 nil：故障时按 FailMode 直接放行/拒绝），每 key 调用一次，返回 nil
-// 视同未提供该 key 的本地桶；需要共享单桶时闭包忽略 key 参数即可。
+// （可 nil：故障时按 FailMode 直接放行/拒绝），**每 key 只调用一次**（#127：
+// 结果由库层按 key 缓存、跨请求共享同一桶实例——随用随建会让故障期间的
+// 每个请求都拿到全新满桶，限流静默失效）；工厂返回 nil 视同未提供该 key 的
+// 本地桶，nil 结果**不缓存**（下次降级会再调工厂，保持「按 key 动态提供/
+// 收回」的语义）；需要共享单桶时闭包忽略 key 参数即可。
 func NewResilientLimiter(dist *PeriodLimit, local func(key string) LocalLimiter, opts ...ResilientOption) *ResilientLimiter {
 	if dist == nil {
 		panic("ratelimit: dist must not be nil")
@@ -176,7 +184,7 @@ func (l *ResilientLimiter) decideFallback(key string) Decision {
 		return l.fallback(Decision{Allowed: false, Source: SourceFailClosed})
 	}
 	if l.local != nil {
-		if lim := l.local(key); lim != nil {
+		if lim := l.localFor(key); lim != nil {
 			return l.fallback(Decision{
 				Allowed: lim.AllowN(time.Now(), 1),
 				Source:  SourceLocalFallback,
@@ -184,6 +192,22 @@ func (l *ResilientLimiter) decideFallback(key string) Decision {
 		}
 	}
 	return l.fallback(Decision{Allowed: true, Source: SourceFailOpen})
+}
+
+// localFor 返回 key 对应的本地兜底桶，工厂结果按 key 缓存（#127）：每个 key
+// 只调一次工厂、跨请求共享同一桶实例——工厂返回新实例≠新桶，随用随建会让
+// Redis 故障期间的每个请求都拿到全新满桶，本地限流 100% 静默失效。
+// 工厂返回 nil 不缓存（保持「未提供该 key 的桶」的可动态语义）。
+func (l *ResilientLimiter) localFor(key string) LocalLimiter {
+	if v, ok := l.localCache.Load(key); ok {
+		return v.(LocalLimiter)
+	}
+	lim := l.local(key)
+	if lim == nil {
+		return nil
+	}
+	actual, _ := l.localCache.LoadOrStore(key, lim)
+	return actual.(LocalLimiter)
 }
 
 // fallback 收口降级决策：观测钩子在此统一触发。

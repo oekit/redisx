@@ -251,3 +251,106 @@ func TestSourceString(t *testing.T) {
 		}
 	}
 }
+
+// TestResilientLimiter_FactoryOncePerKey 回归（#127）：local 工厂对每个 key
+// 只调一次、桶实例跨请求共享——文档承诺「每 key 调用一次」，实现若在每次
+// 降级判定都调工厂，Redis 故障期间每个请求都会拿到全新满桶，限流 100% 静默
+// 失效（#125 为 PeriodLimit 点名的同一坑）。工厂这里**故意每次返回新实例**：
+// 若库层真按 key 缓存，第二发仍被同一只 burst=1 的桶拒绝；未缓存则新桶恒满、
+// 第二发被误放行——调用次数与新实例两条断言正交钉死契约。
+func TestResilientLimiter_FactoryOncePerKey(t *testing.T) {
+	store, mr := newTestStoreFastFail(t)
+	var (
+		mu      sync.Mutex
+		calls   = map[string]int{}
+		buckets = map[string]LocalLimiter{}
+	)
+	l := NewResilientLimiter(NewPeriodLimit(time.Minute, 100, store, "rl"),
+		func(key string) LocalLimiter {
+			mu.Lock()
+			calls[key]++
+			mu.Unlock()
+			b := newLocalBucket(1, 1) // 每次都造新桶：缓存正确时同一 key 恒用第一只
+			mu.Lock()
+			buckets[key] = b
+			mu.Unlock()
+			return b
+		})
+	ctx := context.Background()
+
+	mr.Close() // Redis 故障，降级路径唯一生效期
+
+	for i := 0; i < 3; i++ {
+		d, err := l.Allow(ctx, "k1")
+		if err == nil {
+			t.Fatal("expected underlying redis error to surface")
+		}
+		if i == 0 && (!d.Allowed || d.Source != SourceLocalFallback) {
+			t.Fatalf("first fallback = %+v, want {true SourceLocalFallback}", d)
+		}
+		if i > 0 && (d.Allowed || d.Source != SourceLocalFallback) {
+			t.Fatalf("fallback %d = %+v, want {false SourceLocalFallback} (cached bucket must still rate-limit)", i+1, d)
+		}
+	}
+	d, _ := l.Allow(ctx, "k2") // 另一个 key：独立建桶
+	if !d.Allowed || d.Source != SourceLocalFallback {
+		t.Fatalf("other key fallback = %+v, want {true SourceLocalFallback}", d)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls["k1"] != 1 || calls["k2"] != 1 {
+		t.Fatalf("factory must be called exactly once per key (#127), got %v", calls)
+	}
+}
+
+// TestResilientLimiter_FactoryNilNotCached 工厂返回 nil = 未提供该 key 的
+// 本地桶：降级退化为 fail-open，且 nil 结果**不缓存**——下次降级会再调工厂，
+// 保持「按 key 动态提供/收回」语义（提供后即按缓存桶限速）。
+func TestResilientLimiter_FactoryNilNotCached(t *testing.T) {
+	store, mr := newTestStoreFastFail(t)
+	provide := false
+	var mu sync.Mutex
+	l := NewResilientLimiter(NewPeriodLimit(time.Minute, 100, store, "rl"),
+		func(string) LocalLimiter {
+			mu.Lock()
+			defer mu.Unlock()
+			if !provide {
+				return nil
+			}
+			return newLocalBucket(1, 1)
+		})
+	ctx := context.Background()
+
+	mr.Close() // Redis 故障
+
+	// 阶段一：工厂返回 nil → fail-open 放行
+	d, err := l.Allow(ctx, "k")
+	if err == nil {
+		t.Fatal("expected underlying redis error to surface")
+	}
+	if !d.Allowed || d.Source != SourceFailOpen {
+		t.Fatalf("nil factory = %+v, want {true SourceFailOpen}", d)
+	}
+
+	// 阶段二：工厂开始提供桶 → 无缓存旧值，本次即按本地桶判定
+	mu.Lock()
+	provide = true
+	mu.Unlock()
+	d, err = l.Allow(ctx, "k")
+	if err == nil {
+		t.Fatal("expected underlying redis error to surface")
+	}
+	if !d.Allowed || d.Source != SourceLocalFallback {
+		t.Fatalf("after factory provides = %+v, want {true SourceLocalFallback} (nil must not be cached)", d)
+	}
+
+	// 阶段三：同一桶持续生效（burst=1 已被上一发耗尽）→ 拒绝
+	d, err = l.Allow(ctx, "k")
+	if err == nil {
+		t.Fatal("expected underlying redis error to surface")
+	}
+	if d.Allowed || d.Source != SourceLocalFallback {
+		t.Fatalf("next fallback = %+v, want {false SourceLocalFallback}", d)
+	}
+}
