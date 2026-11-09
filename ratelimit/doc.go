@@ -4,7 +4,9 @@
 // （periodscript.lua / tokenscript.lua），可与其混部共用同一份 Redis 配额：
 //
 //   - [PeriodLimit]：固定窗口计数限流（INCRBY + EXPIRE 原子脚本）。
-//     Take 返回三态（[Allowed] / [HitQuota] / [OverQuota]）。
+//     Take 返回三态（[Allowed] / [HitQuota] / [OverQuota]）；可选 rescue
+//     降级（[WithRescue]，#125）——Redis 故障按 [RescueMode] 给出最终口径
+//     （fail-open / 进程内有界桶），探活回切与 TokenLimiter 同源。
 //   - [TokenLimiter]：令牌桶限流（双 key 惰性回补）。
 //     Allow/AllowN 返回 bool；可选进程内兜底（[WithTokenFallback]）。
 //   - [ResilientLimiter]（#118）：[PeriodLimit] 的「带兜底」组合——Redis
@@ -39,13 +41,29 @@
 // 可用 [WithPeriodAlign] 把窗口对齐到自然周期（本地时区的天/小时边界），
 // 典型场景"每天 5 条短信"。
 //
-// 与 TokenLimiter 不同，PeriodLimit **不做**本地兜底：固定窗口计数是跨实例的
-// 全局精确配额，故障窗口内进程无法在不破坏全局限额的前提下本地近似——本地
-// 放行多少都会放大全局限额。因此 Redis 故障时 Take 直接返回 (Unknown, err)，
-// fail-open 还是 fail-closed 由调用方业务决定。要把「降级到本地令牌桶 +
-// fail 口径 + 降级可观测」这套组合口径单源化（不再每个下游各写一遍），直接
-// 用 [ResilientLimiter]——Redis 路径完全复用 PeriodLimit（同一脚本、同一
-// key 布局），其语义约束（本地桶不破坏全局限额的诚实说明）见下节。
+// # 固定窗口降级 rescue（#125）
+//
+// 默认（RescueOff）Redis 故障时 Take 直接返回 (Unknown, err)——固定窗口计数
+// 是跨实例的全局精确配额，故障窗口内进程无法在不破坏全局限额的前提下本地
+// 近似，放行与否由调用方业务决定。需要内置降级时用 [WithRescue] 按档位
+// 单源配置（不再每个下游手搓 facade）：
+//
+//	l := ratelimit.NewPeriodLimit(time.Hour, 5, rdb, "sms:verify",
+//	    ratelimit.WithRescue(ratelimit.RescueBoundedLocal), // 故障降级到进程内有界桶
+//	    // ratelimit.WithRescueBucket(func(key string) ratelimit.LocalLimiter { ... }), // 可选自定义兜底桶
+//	)
+//	code, err := l.Take(ctx, "13800000000") // 故障期间降级口径与 Redis 判定同形：(Allowed|OverQuota, nil)
+//
+// 三档语义：[RescueOff]（默认，不降级）；[RescueFailOpen]（故障一律放行，
+// 限流失效）；[RescueBoundedLocal]（每 key 一只进程内有界桶，缺省由
+// quota/period 推导等效令牌桶，[WithRescueBucket] 可自定义——桶在首次降级
+// 创建并跨请求共享，规避「随用随建 = 每个请求都拿到刚初始化的满桶」的坑）。
+// 有界降级的诚实口径：降级窗口内各进程各持一只等参桶，全局配额被放大为
+// 「实例数 × 桶容量」；恢复后回到跨实例精确计数。降级期间由后台探活
+// （[WithRescuePingInterval]/[WithRescueProbeTimeout]，与 TokenLimiter 同源
+// 机制）监控 Redis，成功一次即自动回切。降级判定与 Redis 判定在返回码上
+// 不可区分（与 TokenLimiter 兜底同口径）——需要**显式观测**「当前在 Redis
+// 限还是在本地限」的用 [ResilientLimiter]（[Decision.Source]）。
 //
 // # 组合原语 ResilientLimiter（#118）
 //
