@@ -24,7 +24,7 @@ func skipIfNoRedis(t *testing.T) *Client {
 
 func TestBatch_SetGet(t *testing.T) {
 	client := skipIfNoRedis(t)
-	defer client.Close()
+	defer client.Close(context.Background())
 
 	ctx := context.Background()
 	batch := client.NewBatch()
@@ -61,7 +61,7 @@ func TestBatch_SetGet(t *testing.T) {
 
 func TestBatch_Len(t *testing.T) {
 	client := skipIfNoRedis(t)
-	defer client.Close()
+	defer client.Close(context.Background())
 
 	batch := client.NewBatch()
 	if batch.Len() != 0 {
@@ -84,7 +84,7 @@ func TestBatch_Len(t *testing.T) {
 
 func TestCounter_IncrDecr(t *testing.T) {
 	client := skipIfNoRedis(t)
-	defer client.Close()
+	defer client.Close(context.Background())
 
 	ctx := context.Background()
 	counter := client.NewCounter("counter:test")
@@ -125,7 +125,7 @@ func TestCounter_IncrDecr(t *testing.T) {
 
 func TestCounter_IncrWithTTL(t *testing.T) {
 	client := skipIfNoRedis(t)
-	defer client.Close()
+	defer client.Close(context.Background())
 
 	ctx := context.Background()
 	counter := client.NewCounter("counter:ttl:test")
@@ -157,7 +157,7 @@ func TestCounter_IncrWithTTL(t *testing.T) {
 
 func TestBloomFilter_AddExists(t *testing.T) {
 	client := skipIfNoRedis(t)
-	defer client.Close()
+	defer client.Close(context.Background())
 
 	ctx := context.Background()
 	// 每次运行用唯一 key（redisx#41）：BF.ADD 的语义是「本次新添加」还是
@@ -217,7 +217,7 @@ func TestBloomFilter_AddExists(t *testing.T) {
 // 此处断言它不会在后续改动中悄悄变成别的行为。
 func TestBloomFilter_ReuseExistingKey(t *testing.T) {
 	client := skipIfNoRedis(t)
-	defer client.Close()
+	defer client.Close(context.Background())
 
 	ctx := context.Background()
 	key := fmt.Sprintf("bloom:reuse:%d", time.Now().UnixNano())

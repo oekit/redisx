@@ -9,6 +9,7 @@
 //   - key 前缀自动添加（prefix:key 格式）
 //   - 支持 redis.UniversalClient（兼容单机、集群、哨兵模式）
 //   - 提供 Client() 方法获取原生客户端（用于 distlock、tracing 接入等场景）
+//   - Close(ctx) error 幂等关停（sync.Once；重复调用稳定返回同一结果）
 //
 // # 快速接入
 //
@@ -20,7 +21,7 @@
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-//	defer client.Close()
+//	defer client.Close(context.Background())
 //
 // 从配置创建（支持集群）：
 //
