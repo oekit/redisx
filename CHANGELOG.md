@@ -1,3 +1,7 @@
+## [v0.13.1] — 2026-11-10
+
+- - build: 依赖地板对齐（floor sync，无代码变更）
+
 ## [v0.13.0] — 2026-11-10
 
 - - feat(ratelimit): PeriodLimit 补 rescue 降级三档（Off/FailOpen/BoundedLocal）+ WithRescueBucket 每 key 缓存降级桶，探活回切与 TokenLimiter 单源（#125）
