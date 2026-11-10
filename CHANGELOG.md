@@ -1,3 +1,11 @@
+## [v0.14.0] — 2026-11-11
+
+- feat(client)!: Client.Close 统一 `Close(ctx) error` + sync.Once 幂等（#148）——⚠️ BREAKING 签名变更。修复前 `Close() error` 两处违反本仓生命周期硬规则（AGENTS.md「组件 Close 统一 Close(ctx) error 签名 + sync.Once 幂等」）：① 无 ctx 参数，停机流程无法给关闭动作设期限；② 无幂等保护，直接透传 go-redis `baseClient.Close()`（ConnPool CAS 判重），「显式 Close + defer Close」双路径/多持有者各自 Close 时第二次拿到 `redis: client is closed`，正常重复关闭被调用方当成关闭失败上报（issue 探针实测）。修复后 sync.Once 缓存**首次**关闭结果：底层连接池只真正关一次、重复调用稳定返回同一结果（成功即恒 nil），与 etcdx.Client.Close(ctx) 同形——矩阵内「Close(ctx) 幂等」先例补齐 redisx 漏项。回归：TestClient_Close_Idempotent（连续 Close 两次第二次必须 nil——修复前透传 redis.ErrClosed 实测红）、TestClient_Close_CachesFirstResult（首次 error 缓存返回、底层只关一次）、TestClient_Close_SuccessStaysNil
+- fix(config): NewClientFromConfig Ping 失败回收路径不再 `_ =` 吞掉 Close 错误（#149）。修复前 `_ = client.Client().Close()` 把连接池回收失败（半开连接、fd 回收失败）整个丢弃：连接池已拨号而 Ping 失败，恰是**唯一一次**能观测到连接回收失败的时机，吞掉后泄漏零信号；且同一 Close 两套口径（本函数 Ping 错误 `%w` 上抛、client.go Close 直返，唯独此处 `_` 丢弃）。修复后 errors.Join 聚合上抛（`redis ping failed: %w` + `redis close failed: %w`，errors.Is/As 双侧可判定），回收成功时返回口径与历史一致（仅 Ping 错误、消息不变）；Ping 失败回收改走 Client.Close(ctx) 幂等单源（#148），不绕过 sync.Once。回归：TestPingOrCleanup_SurfacesCloseError（Ping 失败 + Close 失败双信号上抛——修复前 `_ =` 吞掉 close 信号实测红）、TestPingOrCleanup_PingErrorOnlyWhenCloseOK、TestPingOrCleanup_OK
+- ⚠️ breaking：`Client.Close()` → `Client.Close(ctx context.Context) error`——全仓调用点（doc.go 标准接入示例、测试）同步改签名；消费方（data 壳等 re-export）需随本版同步调用形态。现代语言特性：errors.Join 聚合双错误（各自 %w，Is/As 单源）；sync.Once + 结果缓存（sync.OnceFunc/OnceValue 不返回值，不贴合「重复调用返回同一 error」契约，故不取）；min/max 本轮无贴合点
+
+关联问题单：redisx#148、redisx#149。
+
 ## [v0.13.2] — 2026-11-10
 
 - - build: 依赖地板对齐（第二轮发版后 floor sync，无代码变更）
