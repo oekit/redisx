@@ -18,7 +18,7 @@ func newTestClient(t *testing.T, prefix string) (*Client, *miniredis.Miniredis) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = c.Close() })
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
 	return c, mr
 }
 
@@ -503,7 +503,7 @@ func TestNewClient_InvalidAddr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected NewClient to succeed (lazy connect), got %v", err)
 	}
-	defer c.Close()
+	defer c.Close(context.Background())
 	if c == nil {
 		t.Error("expected non-nil client")
 	}

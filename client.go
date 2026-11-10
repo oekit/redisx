@@ -3,6 +3,7 @@ package redisx
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -12,6 +13,11 @@ import (
 type Client struct {
 	prefix string
 	client redis.UniversalClient
+
+	// closeOnce/closeErr：Close 幂等（#148）——sync.Once 保证底层连接池只真正
+	// 关一次，首次关闭的结果（含 nil）缓存在 closeErr，重复调用稳定返回同一结果。
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // RedisClientOption 配置 Client 的可选参数。
@@ -123,9 +129,21 @@ func NewClientFromAddr(addr, password string, db int, opts ...RedisClientOptionF
 	return NewClient(opt, opts...)
 }
 
-// Close 关闭底层 Redis 连接。
-func (c *Client) Close() error {
-	return c.client.Close()
+// Close 幂等关闭底层 Redis 连接（#148）。
+//
+// 契约（本仓生命周期硬规则：组件 Close 统一 Close(ctx) error + sync.Once 幂等）：
+//   - sync.Once 保证「显式 Close + defer Close」双路径、多持有者各自 Close 时
+//     底层连接池只真正关一次，重复调用稳定返回**首次**关闭的结果（成功即恒 nil，
+//     不再透传 go-redis 的 redis.ErrClosed——「二次关闭被误记为关闭失败」的口径
+//     就此关闭）；
+//   - 签名与 etcdx.Client.Close(ctx) 同形（矩阵统一口径）：底层 go-redis 连接池
+//     关闭是同步有界操作，ctx 仅承接统一签名、不参与期限控制（无需 goroutine
+//     包装），停机期限由调用方在外层关停流程约束。
+func (c *Client) Close(_ context.Context) error {
+	c.closeOnce.Do(func() {
+		c.closeErr = c.client.Close()
+	})
+	return c.closeErr
 }
 
 // Ping 测试连接。

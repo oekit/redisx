@@ -63,7 +63,7 @@ func TestNewClient_DoesNotMutateCallerOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first NewClient: %v", err)
 	}
-	defer func() { _ = c1.Close() }()
+	defer func() { _ = c1.Close(context.Background()) }()
 
 	// 第一次调用后，调用方的 opt 必须原样：五个会填默认值的字段不得被写。
 	if opt.DialTimeout != 0 || opt.ReadTimeout != 0 || opt.WriteTimeout != 0 ||
@@ -76,7 +76,7 @@ func TestNewClient_DoesNotMutateCallerOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second NewClient from reused opt: %v", err)
 	}
-	defer func() { _ = c2.Close() }()
+	defer func() { _ = c2.Close(context.Background()) }()
 
 	if opt.DialTimeout != 0 || opt.ReadTimeout != 0 || opt.WriteTimeout != 0 ||
 		opt.PoolTimeout != 0 || opt.MinIdleConns != 0 {
@@ -99,7 +99,7 @@ func TestNewClient_ExplicitFieldsPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	defer func() { _ = c.Close() }()
+	defer func() { _ = c.Close(context.Background()) }()
 
 	if opt.DialTimeout != 7*time.Second || opt.ReadTimeout != 9*time.Second ||
 		opt.WriteTimeout != 11*time.Second || opt.PoolTimeout != 13*time.Second ||
@@ -122,7 +122,7 @@ func TestNewClient_NilOptionsReturnsError(t *testing.T) {
 	c, err := NewClient(nil)
 	if err == nil {
 		if c != nil {
-			_ = c.Close()
+			_ = c.Close(context.Background())
 		}
 		t.Fatal("NewClient(nil) must return a non-nil error")
 	}

@@ -2,6 +2,7 @@ package redisx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -27,10 +28,29 @@ func NewClientFromConfig(ctx context.Context, cfg RedisConfig) (*Client, error) 
 	if err != nil {
 		return nil, err
 	}
-	if err := client.Ping(ctx).Err(); err != nil {
-		// Ping 失败也要回收已创建的 client（连接池已拨号）
-		_ = client.Client().Close()
-		return nil, fmt.Errorf("redis ping failed: %w", err)
+	if err := pingOrCleanup(ctx, client); err != nil {
+		return nil, err
 	}
 	return client, nil
+}
+
+// pingOrCleanup 连通性探测：Ping 失败时回收已创建的 client（连接池已拨号），
+// 并把回收失败一并上抛（#149）。
+//
+// 契约（本仓错误处理硬规则：所有 error 禁止 `_` 忽略）：连接池已拨号而 Ping
+// 失败，恰是**唯一一次**能观测到连接回收失败（半开连接、fd 回收失败）的时机，
+// 回收错误不得静默丢弃——与 Ping 错误经 errors.Join 聚合上抛（两侧各自 %w
+// 包装，errors.Is/As 判定口径不变）；回收成功时返回口径与历史一致（仅 Ping
+// 错误）。回收走 Client.Close(ctx) 幂等单源（#148），不绕过 sync.Once。
+func pingOrCleanup(ctx context.Context, client *Client) error {
+	if err := client.Ping(ctx).Err(); err != nil {
+		if cerr := client.Close(ctx); cerr != nil {
+			return errors.Join(
+				fmt.Errorf("redis ping failed: %w", err),
+				fmt.Errorf("redis close failed: %w", cerr),
+			)
+		}
+		return fmt.Errorf("redis ping failed: %w", err)
+	}
+	return nil
 }
