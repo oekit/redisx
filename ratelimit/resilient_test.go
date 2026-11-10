@@ -251,3 +251,74 @@ func TestSourceString(t *testing.T) {
 		}
 	}
 }
+
+// TestResilientLimiter_FactoryOncePerKey（#127）工厂每 key 至多一次：降级判定
+// 在每次 Unknown Allow 都会发生，工厂结果必须按 key 缓存——不缓存则读文档的
+// 消费者「return xrate.NewLimiter(...)」每请求拿全新满桶，限流静默死亡。
+func TestResilientLimiter_FactoryOncePerKey(t *testing.T) {
+	store, mr := newTestStoreFastFail(t)
+	mr.Close()
+	var (
+		mu    sync.Mutex
+		calls = map[string]int{}
+	)
+	l := NewResilientLimiter(NewPeriodLimit(time.Minute, 100, store, "rl"),
+		func(key string) LocalLimiter {
+			mu.Lock()
+			calls[key]++
+			mu.Unlock()
+			return newLocalBucket(1, 100)
+		})
+	for i := 0; i < 5; i++ {
+		d, _ := l.Allow(context.Background(), "k1")
+		if d.Source != SourceLocalFallback {
+			t.Fatalf("k1 #%d source = %v, want SourceLocalFallback", i, d.Source)
+		}
+	}
+	mu.Lock()
+	if calls["k1"] != 1 {
+		t.Fatalf("工厂对 k1 被调 %d 次, want 1", calls["k1"])
+	}
+	mu.Unlock()
+	_, _ = l.Allow(context.Background(), "k2")
+	mu.Lock()
+	if calls["k2"] != 1 {
+		t.Fatalf("工厂对 k2 被调 %d 次, want 1", calls["k2"])
+	}
+	mu.Unlock()
+}
+
+// TestResilientLimiter_NilBucketNotCached（#127）nil 结果不缓存：返回 nil 的
+// key 每次降级判定重问工厂，保持「返回 nil 视同未提供」的动态语义。
+func TestResilientLimiter_NilBucketNotCached(t *testing.T) {
+	store, mr := newTestStoreFastFail(t)
+	mr.Close()
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+	provide := false
+	l := NewResilientLimiter(NewPeriodLimit(time.Minute, 100, store, "rl"),
+		func(key string) LocalLimiter {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			if !provide {
+				return nil
+			}
+			return newLocalBucket(1, 100)
+		})
+	for i := 0; i < 3; i++ {
+		_, _ = l.Allow(context.Background(), "k")
+	}
+	mu.Lock()
+	if calls != 3 {
+		t.Fatalf("工厂在未供桶时被调 %d 次, want 3", calls)
+	}
+	mu.Unlock()
+	provide = true
+	d, _ := l.Allow(context.Background(), "k")
+	if d.Source != SourceLocalFallback {
+		t.Fatalf("供桶后 source = %v, want SourceLocalFallback", d.Source)
+	}
+}

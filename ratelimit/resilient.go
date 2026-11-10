@@ -2,6 +2,7 @@ package ratelimit
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -112,7 +113,8 @@ func WithFallbackMetrics(fn func(Source)) ResilientOption {
 // 判定顺序：每次 Allow 都先尝试 Redis（无探活后台 goroutine），故障才降级
 // ⇒ Redis 恢复后下一次调用自动切回 SourceRedis，不会永久钉在本地兜底
 // （故障期间每次请求多付一次失败的往返，由调用方 ctx 超时兜底）。
-// ResilientLimiter 构造后字段不再变更，可并发使用。
+// localOnce 的缓存写入是判定路径上唯一可变状态（sync.Map 并发安全），其余
+// 字段构造后不变。可并发使用。
 type ResilientLimiter struct {
 	dist  *PeriodLimit
 	local func(key string) LocalLimiter
@@ -120,14 +122,21 @@ type ResilientLimiter struct {
 	failMode FailMode
 	// onFallback 经 WithFallbackMetrics 写入，判定路径只读。
 	onFallback func(Source)
+	// localOnce 按 key 缓存工厂结果（#127）：兑现「每 key 调用一次」文档
+	// 契约——降级判定在每次 Unknown Allow 都会发生，不缓存则读文档的消费者
+	// 「return xrate.NewLimiter(...)」在故障期每请求拿全新满桶，限流静默死亡
+	// （#125 点名的形态）。nil 结果不缓存（见 localBucket）。
+	localOnce sync.Map
 }
 
 // NewResilientLimiter 创建组合限流器。
 //
 // dist 为 Redis 侧判定（必填；nil 属编程错误，直接 panic——静默 nil 会让
 // 每次判定都走降级路径，限流形同虚设且无报错）；local 为本地兜底桶工厂
-// （可 nil：故障时按 FailMode 直接放行/拒绝），每 key 调用一次，返回 nil
-// 视同未提供该 key 的本地桶；需要共享单桶时闭包忽略 key 参数即可。
+// （可 nil：故障时按 FailMode 直接放行/拒绝），对每个 key **至多调用一次**
+// 并缓存其结果（#127）；返回 nil 的 key 视同未提供本地桶，该结果不缓存
+// （每次降级判定都会重问工厂，保持动态语义）；需要共享单桶时闭包忽略 key
+// 参数即可。
 func NewResilientLimiter(dist *PeriodLimit, local func(key string) LocalLimiter, opts ...ResilientOption) *ResilientLimiter {
 	if dist == nil {
 		panic("ratelimit: dist must not be nil")
@@ -176,7 +185,7 @@ func (l *ResilientLimiter) decideFallback(key string) Decision {
 		return l.fallback(Decision{Allowed: false, Source: SourceFailClosed})
 	}
 	if l.local != nil {
-		if lim := l.local(key); lim != nil {
+		if lim := l.localBucket(key); lim != nil {
 			return l.fallback(Decision{
 				Allowed: lim.AllowN(time.Now(), 1),
 				Source:  SourceLocalFallback,
@@ -184,6 +193,23 @@ func (l *ResilientLimiter) decideFallback(key string) Decision {
 		}
 	}
 	return l.fallback(Decision{Allowed: true, Source: SourceFailOpen})
+}
+
+// localBucket 取 key 的本地兜底桶（#127）：工厂结果按 key 缓存，兑现
+// 「每 key 至多调用一次」契约——decideFallback 在每次 Unknown Allow 都会
+// 进来，不缓存则读文档/消费惯性的「随用随建」每请求拿全新满桶，限流静默
+// 死亡（#125 点名的形态）。工厂返回 nil 的 key 不缓存（每次降级判定重问
+// 工厂，保持「返回 nil 视同未提供」的动态语义）。
+func (l *ResilientLimiter) localBucket(key string) LocalLimiter {
+	if v, ok := l.localOnce.Load(key); ok {
+		lim, _ := v.(LocalLimiter)
+		return lim
+	}
+	lim := l.local(key)
+	if lim != nil {
+		l.localOnce.Store(key, lim)
+	}
+	return lim
 }
 
 // fallback 收口降级决策：观测钩子在此统一触发。
