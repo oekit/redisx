@@ -2,21 +2,21 @@ package distlock
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	concrl "github.com/oekit/concurrency/ratelimit"
 
+	"github.com/oekit/redisx/internal/ctxerr"
 	"github.com/redis/go-redis/v9"
 )
 
 // isCtxErr 调用方 ctx 取消/超时判定：不是 Redis 故障，不触发降级（调用方
-// 自己的主动放弃不该把判定路由进进程内降级实现）。与 ratelimit 包对
-// TokenLimiter/PeriodLimit rescue 的口径一致。
+// 自己的主动放弃不该把判定路由进进程内降级实现）。实现单源在 internal/ctxerr
+// （redisx#162，与 ratelimit 包共调同一实现，口径由编译期绑定而非注释约束）。
 func isCtxErr(err error) bool {
-	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+	return ctxerr.Is(err)
 }
 
 // GuardConfig 是 BruteForceGuard 的构造配置：分布式 Lockout 与进程内降级实现

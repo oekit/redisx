@@ -1,25 +1,17 @@
 package distlock
 
 import (
-	"context"
-	"time"
+	pkgdistlock "github.com/oekit/pkg/distlock"
 )
 
-// Locker 是分布式锁接口，面向接口编程。
-// 支持多种后端实现（Redis、etcd、ZooKeeper 等）。
-type Locker interface {
-	// TryLock 非阻塞尝试获取锁。
-	// 返回 (ownerID, nil) 表示成功，ownerID 用于后续 Unlock。
-	// 返回 ("", ErrLockNotAcquired) 表示锁被占用。
-	TryLock(ctx context.Context, key string, ttl time.Duration) (string, error)
-
-	// Lock 阻塞获取锁，带超时重试。
-	// 返回 (ownerID, nil) 表示成功。
-	// 返回 ("", ErrLockTimeout) 表示超时未获取到。
-	Lock(ctx context.Context, key string, ttl time.Duration, timeout time.Duration) (string, error)
-
-	// Unlock 释放锁，ownerID 必须匹配。
-	// 返回 nil 表示锁已删除；锁不存在或已易主（陈旧持有者解锁）返回
-	// ErrLockNotHeld（调用方不得继续假装持有）；其它 error 为后端通信故障。
-	Unlock(ctx context.Context, key string, ownerID string) error
-}
+// Locker 是分布式锁的后端中立接口。etcdx#123 契约单源后，接口定义上提至
+// [pkgdistlock.Locker]（pkg v0.45.0），本包以**类型别名**消费同一份契约：
+// 方法集（TryLock/Lock/Unlock）与哨兵语义与历史版本逐字相同，任何历史上
+// 实现 redisx/distlock.Locker 的类型同时满足 pkg 侧契约，反之亦然——
+// 同进程两个写法指向同一 interface 类型，不再有「两仓接口各写一份、靠
+// 注释互相提醒手工对账」的形态。
+//
+// 后端特有能力（自动续期 WithAutoRenew、手动续期 Renew、最大持锁时长等）
+// 仍留在本包具体类型/构造选项上，不进中立接口；需要可判定的可选能力时按
+// 接口断言外置（与 pkg/distlock 的实现约定一致）。
+type Locker = pkgdistlock.Locker

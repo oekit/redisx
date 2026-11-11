@@ -64,38 +64,30 @@ func (bf *BloomFilter) Exists(ctx context.Context, item string) (bool, error) {
 // MAdd 批量添加元素。
 // 返回每个元素的结果：true 表示新添加，false 表示已存在。
 func (bf *BloomFilter) MAdd(ctx context.Context, items ...string) ([]bool, error) {
-	args := make([]any, 0, len(items)+2)
-	args = append(args, "BF.MADD", bf.client.convertKey(bf.key))
-	for _, item := range items {
-		args = append(args, item)
-	}
-
-	cmd := bf.client.client.Do(ctx, args...)
-	if cmd.Err() != nil {
-		return nil, cmd.Err()
-	}
-
-	results, err := cmd.BoolSlice()
-	if err != nil {
-		return nil, err
-	}
-	return results, nil
+	return bf.mDo(ctx, "BF.MADD", items...)
 }
 
 // MExists 批量检查元素是否存在。
 func (bf *BloomFilter) MExists(ctx context.Context, items ...string) ([]bool, error) {
+	return bf.mDo(ctx, "BF.MEXISTS", items...)
+}
+
+// mDo 是 MAdd/MExists 的共享实现（redisx#163）：两者除命令名外逐字相同
+// （args 预分配 + 拼命令 + convertKey + Do + BoolSlice），收敛后模板只此
+// 一份，两个导出方法各留一行。
+func (bf *BloomFilter) mDo(ctx context.Context, cmd string, items ...string) ([]bool, error) {
 	args := make([]any, 0, len(items)+2)
-	args = append(args, "BF.MEXISTS", bf.client.convertKey(bf.key))
+	args = append(args, cmd, bf.client.convertKey(bf.key))
 	for _, item := range items {
 		args = append(args, item)
 	}
 
-	cmd := bf.client.client.Do(ctx, args...)
-	if cmd.Err() != nil {
-		return nil, cmd.Err()
+	resp := bf.client.client.Do(ctx, args...)
+	if resp.Err() != nil {
+		return nil, resp.Err()
 	}
 
-	results, err := cmd.BoolSlice()
+	results, err := resp.BoolSlice()
 	if err != nil {
 		return nil, err
 	}

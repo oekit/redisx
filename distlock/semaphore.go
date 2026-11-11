@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
 	"github.com/redis/go-redis/v9"
 )
@@ -270,118 +269,49 @@ func (s *Semaphore) Cleanup(ctx context.Context, olderThan time.Duration) (int64
 	return n, nil
 }
 
-// startAutoRenew 启动槽位自动续期 watchdog（#126，与 RedisLocker.startAutoRenew
-// 同一状态机形态）：每次 Acquire 成功创建独立 lockState（identifier 对位
-// ownerID），per-identifier 隔离；独立 derived context，续期生命周期与槽位
-// 绑定而非调用方 context。
+// startAutoRenew 启动槽位自动续期 watchdog（#126）：每次 Acquire 成功创建
+// 独立 lockState（identifier 对位 ownerID），per-identifier 隔离；独立
+// derived context，续期生命周期与槽位绑定而非调用方 context。
 //
-// 覆盖旧 state 前先停掉它（同 RedisLocker 的 #33 防御）：同一 identifier 的
-// 旧 watchdog 若仍在续期，它的 goroutine 只能等下一个 tick 才发现槽已不属于
-// 自己——既泄漏 goroutine，又打出误导性的 "slot lost" 告警。幂等刷新成功
-// 意味着槽位仍是本人的，停掉旧续期、起新的即可。
+// 状态机本体（Swap-停旧、interval 推导、maxLifetime 三态、goroutine 循环）
+// 与 RedisLocker 单源同一份 [renewWatchdog]（#159）——#33/#39 两个历史修复
+// 从此只有一份；本方法只注入 renew 闭包与告警文案。幂等刷新成功意味着槽位
+// 仍是本人的，覆盖旧 state 前先停掉旧续期（newRenewWatchdog 内置的 #33 防御）。
 //
 // 续期受最大生命周期约束（WithSemaphoreMaxAutoRenew，默认 10×slotTTL）：到期
 // 后 goroutine 退出并记 Warn，槽位在 slotTTL 后自然过期回收——防止忘记
 // Release 导致永久占槽与 goroutine 泄漏（配额自愈语义重新生效）。
 func (s *Semaphore) startAutoRenew(identifier string) {
-	renewCtx, cancel := context.WithCancel(context.Background())
-	st := &lockState{ownerID: identifier, stopChan: make(chan struct{}), cancel: cancel}
-	if old, ok := s.sessions.Swap(identifier, st); ok {
-		if prev, ok := old.(*lockState); ok {
-			prev.once.Do(func() {
-				if prev.cancel != nil {
-					prev.cancel()
-				}
-				close(prev.stopChan)
-			})
-		}
+	w := newRenewWatchdog(&s.sessions, identifier, identifier)
+	w.interval = renewIntervalFrom(s.renewInterval, s.slotTTL)
+	w.maxLifetime = renewMaxLifetime(s.maxAutoRenew, s.slotTTL)
+	w.renew = func(ctx context.Context) (bool, error) {
+		return s.Renew(ctx, identifier)
 	}
-
-	interval := s.renewInterval
-	if interval <= 0 {
-		// 缺省 slotTTL/2（与 Lock 的推导同源）：续期失败的容忍窗口 = 剩余
-		// 半个 TTL。亚毫秒 slotTTL 收紧到 1ms 下限，避免高频 ticker 空转
-		// （续期毫秒量化的下限同为 1ms，见 ttlMillis/#54）。
-		interval = s.slotTTL / 2
-		if interval < time.Millisecond {
-			interval = time.Millisecond
-		}
+	w.onRetryErr = func(err error) {
+		s.logr().Warn("auto renew failed, will retry",
+			"key", s.key, "identifier", identifier, logx.ErrKey, err)
 	}
-	if interval <= 0 {
-		interval = 1 * time.Second
+	w.onLost = func() {
+		// Renew 返回 (false, nil)：槽位已丢失（过期回收/已被 Release/配额被
+		// 他人接管）——「以为自己还占着配额」是静默脑裂形态（#126），调用方
+		// 应重新 Acquire。
+		s.logr().Warn("auto renew failed: semaphore slot lost or recycled",
+			"key", s.key, "identifier", identifier)
 	}
-
-	// 计算续期最大生命周期：0（未设置）= 10×slotTTL；负值 = 不限制（0 表示无 deadline）。
-	maxLifetime := s.maxAutoRenew
-	switch {
-	case maxLifetime == 0:
-		maxLifetime = 10 * s.slotTTL
-	case maxLifetime < 0:
-		maxLifetime = 0
+	w.onGaveUp = func(maxLifetime time.Duration) {
+		s.logr().Warn("auto renew exceeded max lifetime, giving up slot",
+			"key", s.key, "identifier", identifier, "max_lifetime", maxLifetime)
 	}
-	stopChan := st.stopChan
-
-	async.GoSafe(func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-
-		// 计时器必须在 goroutine 内部创建并停止（#39 同款：defer 是函数级的，
-		// 放在外面会在 startAutoRenew 返回瞬间就 Stop 掉计时器 ⇒ 安全网失效）。
-		var lifetimeTimer *time.Timer
-		var lifetimeC <-chan time.Time
-		if maxLifetime > 0 {
-			lifetimeTimer = time.NewTimer(maxLifetime)
-			defer lifetimeTimer.Stop()
-			lifetimeC = lifetimeTimer.C
-		}
-
-		for {
-			select {
-			case <-renewCtx.Done():
-				return
-			case <-stopChan:
-				return
-			case <-lifetimeC:
-				// 达到最大续期生命周期：放弃续期，槽位将在 slotTTL 后自然过期回收。
-				// 这是忘记 Release 时的安全网（默认 10×slotTTL）。
-				s.logr().Warn("auto renew exceeded max lifetime, giving up slot",
-					"key", s.key, "identifier", identifier, "max_lifetime", maxLifetime)
-				return
-			case <-ticker.C:
-				ok, err := s.Renew(renewCtx, identifier)
-				if err != nil {
-					// 瞬时错误（网络抖动、failover）不放弃：下一个 tick 重试。
-					// watchdog 一旦退出，槽位将在 slotTTL 后被回收。
-					s.logr().Warn("auto renew failed, will retry",
-						"key", s.key, "identifier", identifier, logx.ErrKey, err)
-					continue
-				}
-				if !ok {
-					// Renew 返回 (false, nil)：槽位已丢失（过期回收/已被 Release/
-					// 配额被他人接管）——显式告警后退出。继续执行会超出配额
-					// （「以为自己还占着配额」是静默脑裂形态，#126），调用方
-					// 应重新 Acquire。
-					s.logr().Warn("auto renew failed: semaphore slot lost or recycled",
-						"key", s.key, "identifier", identifier)
-					return
-				}
-			}
-		}
-	})
+	w.startAutoRenew()
 }
 
 // stopAutoRenew 停掉 identifier 对应的续期 watchdog。LoadAndDelete 原子取删：
-// 只有拿到状态的这一方负责 stop（幂等，once 保护），不存在「误杀他人」的
-// 形态——key 即 identifier，状态与身份一一对应（区别于 Locker 的 key/ownerID
-// 二元比对）。
+// 只有拿到状态的这一方负责 stop（幂等，stopState once 保护），不存在「误杀
+// 他人」的形态——key 即 identifier，状态与身份一一对应（区别于 Locker 的
+// key/ownerID 二元比对）。
 func (s *Semaphore) stopAutoRenew(identifier string) {
 	if v, ok := s.sessions.LoadAndDelete(identifier); ok {
-		cur := v.(*lockState)
-		cur.once.Do(func() {
-			if cur.cancel != nil {
-				cur.cancel()
-			}
-			close(cur.stopChan)
-		})
+		stopState(v.(*lockState))
 	}
 }
