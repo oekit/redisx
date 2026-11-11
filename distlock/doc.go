@@ -3,13 +3,30 @@
 // 定义 Locker 接口，支持多种后端实现（Redis、etcd、ZooKeeper 等）。
 // 当前提供 RedisLocker 实现。
 //
+// # 契约单源（etcdx#123，pkg v0.45.0 起）
+//
+// Locker 接口、三个哨兵错误（ErrLockNotAcquired / ErrLockTimeout /
+// ErrLockNotHeld）与 WithLock 的实现已上提至 [github.com/oekit/pkg/distlock]
+// 契约单源，本包以**别名/薄转发**消费：
+//
+//   - [Locker] = pkg/distlock.Locker（类型别名，同进程同一 interface 类型）；
+//   - 三个哨兵是 pkg 侧同值变量的包级别名（文案不变，errors.Is 两侧任一
+//     写法都命中——同进程只此一套哨兵值）；
+//   - [WithLock] 薄转发 pkg 实现（签名/错误口径不变；释放失败的告警改由
+//     pkg 记 log/slog，见 WithLock 注释）。
+//
+// 后端特有能力（自动续期、手动续期 Renew、最大持锁时长等）仍留在本包
+// 具体类型/构造选项上，不进中立接口。跨后端互换（etcdx 等）从此共享同一
+// 契约：同一份接口、同一套哨兵，不再靠注释互相提醒手工对账。
+//
 // # 核心特性
 //
-//   - Locker 接口，面向接口编程
+//   - Locker 接口（etcdx#123 契约单源的别名），面向接口编程
 //   - SetNX 加锁 + Lua 原子释放（防止误删他人的锁）
 //   - 支持单次尝试（TryLock）和带超时重试（Lock）
 //   - 可选自动续期（WithAutoRenew，TryLock/Lock 对称生效，含最大生命周期
-//     安全网）与手动续期（RedisLocker.Renew，Lua CAS 毫秒精度）
+//     安全网）与手动续期（RedisLocker.Renew，Lua CAS 毫秒精度）；续期
+//     watchdog 状态机在 Locker 与 Semaphore 单源同一份（#159）
 //   - Semaphore 分布式信号量——ZSET 槽位配额（同一时刻 N 个持有者），
 //     持有者崩溃后槽位 slotTTL 过期自愈；可选自动续期 watchdog
 //     （WithSemaphoreAutoRenew，#126，与 Lock 的续期家族同构：间隔缺省
@@ -17,7 +34,7 @@
 //   - BruteForceGuard 防爆破锁对组合口（#128）：分布式 Lockout + 进程内
 //     降级实现（concurrency/ratelimit.Lockout）+ Redis 故障时的双实现
 //     路由，阈值/窗口/锁定时长库内同源，Fail/Check/Reset 对外统一
-//   - 便捷包装 WithLock（加锁→执行→自动释放）
+//   - 便捷包装 WithLock（加锁→执行→自动释放；实现上提 pkg 契约单源）
 //   - 可选无 Redis 时降级放行（单实例部署场景）
 //   - 可选 per-instance 日志注入（WithLogger / WithSemaphoreLogger，#120）：
 //     watchdog 告警只进注入的 logger；缺省实例私有的 logx.Delegating("distlock")，
@@ -169,10 +186,13 @@
 //
 // # 错误处理
 //
-// 包定义了两个哨兵错误，用于判断锁获取失败的原因：
+// 包名下有三个哨兵错误（etcdx#123 契约单源后为 pkg/distlock 同值变量的
+// 别名），用于判断锁获取失败的原因：
 //
 //   - [ErrLockNotAcquired]：TryLock 时锁被占用（非阻塞失败）
 //   - [ErrLockTimeout]：Lock 超时未获取到锁
+//   - [ErrLockNotHeld]：Unlock 时锁不存在或已易主（#115，本次未删任何锁，
+//     调用方不得继续假装持有）
 //
 // 其他错误表示 Redis 通信问题，应记录日志并适当处理。
 //

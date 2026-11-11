@@ -74,8 +74,9 @@ type PeriodLimit struct {
 	// rescue 降级配置（仅构造期经选项写入，判定路径只读）
 	rescue       RescueMode
 	rescueBucket func(key string) LocalLimiter
-	// buckets 是降级桶缓存：key → LocalLimiter。首次降级按需创建并跨请求
-	// 共享（#125 的构造期生命周期语义按 key 落地），判定路径并发读写。
+	// buckets 是降级桶缓存：key → *bucketEntry。首次降级按需创建并跨请求
+	// 共享（#125 的构造期生命周期语义按 key 落地），判定路径并发读写；
+	// 回切/Close 时清空（#167，防高基数 key 长故障窗口后常驻内存）。
 	buckets sync.Map
 	// 探活降级机制（pingInterval/probeTimeout/redisAlive/startMonitor 经嵌入
 	// 字段透出，与 TokenLimiter 同源，#125）。
@@ -147,7 +148,13 @@ func WithRescueProbeTimeout(d time.Duration) PeriodOption {
 // quota <= 0 属于编程错误，直接 panic（fail-fast，与 NewTokenLimiter 对
 // rate/burst 的校验口径一致）——静默接受会让 Lua 的 current < limit /
 // current == limit 均不成立，每次 Take 都 OverQuota，流量 100% 被拒且无报错（#92）。
+// store 为 nil 同样构造期 fail-fast（#168）：历史实现不拦，故障延迟到首次
+// Take 的 nil interface panic，堆栈落在 go-redis 内部帧——与「构造时忘传
+// client」的排查路径相同，堆栈无诊断价值。
 func NewPeriodLimit(period time.Duration, quota int64, store redis.Scripter, keyPrefix string, opts ...PeriodOption) *PeriodLimit {
+	if store == nil {
+		panic("ratelimit: store must not be nil")
+	}
 	if quota <= 0 {
 		panic("ratelimit: quota must be positive")
 	}
@@ -162,6 +169,9 @@ func NewPeriodLimit(period time.Duration, quota int64, store redis.Scripter, key
 		keyPrefix:    keyPrefix,
 		redisMonitor: newRedisMonitor(store),
 	}
+	// 回切即清降级桶缓存（#167）：Redis 恢复后进程内桶失去存在意义，
+	// 高基数 key（per-user/per-token）不再随一次长故障窗口沉淀全量条目。
+	l.onRecover = l.buckets.Clear
 	for _, opt := range opts {
 		opt(l)
 	}
@@ -251,24 +261,64 @@ func (l *PeriodLimit) takeRescued(key string) (int, error) {
 	}
 }
 
-// bucketFor 返回 key 的进程内兜底桶：首次降级按需创建并缓存（sync.Map），
-// 此后跨请求共享同一实例——Redis 故障期间每个请求都拿到全新满桶 = 限流失效
-// （#125 点名的坑），缓存保证每个 key 只建一次。自定义工厂返回 nil 不缓存。
+// bucketEntry 是降级桶缓存条目（redisx#166）：once 把「工厂调用」从
+// check-then-act 收敛为 per-key singleflight——并发首次降级时只有一个
+// goroutine 调用工厂，其余等待并拿到同一实例（不再出现「Load miss 与
+// LoadOrStore 之间无同步，落选者的桶实例被丢弃、自定义工厂被重复调用」
+// 与「工厂只调一次（#127）」承诺不符的形态）。工厂返回 nil 时条目不驻留
+// 缓存（保持「nil 不缓存、下次降级再调工厂」的按 key 动态提供/收回语义）。
+type bucketEntry struct {
+	once  sync.Once
+	build func() LocalLimiter
+	lim   LocalLimiter
+}
+
+// get 触发（或等待）本条目的单次工厂调用。
+func (e *bucketEntry) get() LocalLimiter {
+	e.once.Do(func() { e.lim = e.build() })
+	return e.lim
+}
+
+// bucketFor 返回 key 的进程内兜底桶：首次降级按需创建并缓存，此后跨请求
+// 共享同一实例——Redis 故障期间每个请求都拿到全新满桶 = 限流失效（#125
+// 点名的坑）。自定义工厂返回 nil 不缓存。
 func (l *PeriodLimit) bucketFor(key string) LocalLimiter {
 	if v, ok := l.buckets.Load(key); ok {
-		return v.(LocalLimiter)
+		return v.(*bucketEntry).get()
 	}
-	var b LocalLimiter
+	build := l.bucketBuildFor(key)
+	// Load miss 与 LoadOrStore 之间无同步也安全：并发双方各持一个 entry，
+	// 落选者的 entry 因 once 未触发而从未调用工厂，零副作用、即弃。
+	e := &bucketEntry{build: build}
+	actual, _ := l.buckets.LoadOrStore(key, e)
+	lim := actual.(*bucketEntry).get()
+	if lim == nil {
+		// 工厂返回 nil：该 key 的「无桶」结论不缓存。仅当缓存仍指向本条目
+		// 时删除（并发窗口里可能已有更新条目，不可误删）。
+		if cur, ok := l.buckets.Load(key); ok && cur == actual {
+			l.buckets.Delete(key)
+		}
+	}
+	return lim
+}
+
+// bucketBuildFor 返回 key 的桶构建闭包：自定义工厂（[WithRescueBucket]）或
+// 缺省的 quota/period 推导令牌桶。
+func (l *PeriodLimit) bucketBuildFor(key string) func() LocalLimiter {
 	if l.rescueBucket != nil {
-		b = l.rescueBucket(key)
-	} else {
-		b = newRescueBucketFor(l.quota, l.period)
+		return func() LocalLimiter { return l.rescueBucket(key) }
 	}
-	if b == nil {
-		return nil
-	}
-	actual, _ := l.buckets.LoadOrStore(key, b)
-	return actual.(LocalLimiter)
+	return func() LocalLimiter { return newRescueBucketFor(l.quota, l.period) }
+}
+
+// Close 停掉探活 watchdog（redisx#165）并清空降级桶缓存（#167），幂等
+// （sync.Once，对齐仓内「组件 Close 统一 Close(ctx) error」生命周期硬规则）。
+// Close 后 Redis 故障不再自动回切（探活停转），已处于降级态的判定口径不变；
+// 限流器本体仍可调用（Take 照常执行），但宿主不应再使用已 Close 的实例。
+func (l *PeriodLimit) Close(_ context.Context) error {
+	l.stop()
+	l.buckets.Clear()
+	return nil
 }
 
 // newRescueBucketFor 由固定窗口参数推导等效令牌桶：平均速率 quota/period 每秒、

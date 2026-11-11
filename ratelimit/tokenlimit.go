@@ -78,8 +78,14 @@ func WithTokenProbeTimeout(d time.Duration) TokenOption {
 // "{keyPrefix}.ts"，花括号为 Redis Cluster hash-tag，保证两 key 同 slot
 // （沿用 go-zero 惯例）。
 //
-// rate/burst 非法或 keyPrefix 为空属于编程错误，直接 panic。
+// rate/burst 非法或 keyPrefix 为空属于编程错误，直接 panic。store 为 nil
+// 同样构造期 fail-fast（#168）：历史实现不拦，故障延迟到首次 Allow 的
+// nil interface panic，堆栈落在 go-redis 内部帧——与「构造时忘传 client」
+// 的排查路径相同，堆栈无诊断价值。
 func NewTokenLimiter(rate, burst int, store redis.Scripter, keyPrefix string, opts ...TokenOption) *TokenLimiter {
+	if store == nil {
+		panic("ratelimit: store must not be nil")
+	}
 	if rate <= 0 || burst <= 0 {
 		panic("ratelimit: rate and burst must be positive")
 	}
@@ -134,8 +140,9 @@ func (l *TokenLimiter) reserveN(ctx context.Context, n int) bool {
 	if errors.Is(err, redis.Nil) {
 		return false
 	}
-	// 调用方 ctx 取消/超时：不是 Redis 故障，不触发兜底，直接拒绝
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+	// 调用方 ctx 取消/超时：不是 Redis 故障，不触发兜底，直接拒绝（判定单源
+	// 同 isCtxErr/internal/ctxerr，redisx#162）
+	if isCtxErr(err) {
 		return false
 	}
 	if err != nil {
@@ -159,4 +166,15 @@ func (l *TokenLimiter) onRedisFailure(n int) bool {
 	}
 	l.startMonitor()
 	return l.rescueLimiter.AllowN(time.Now(), n)
+}
+
+// Close 停掉探活 watchdog（redisx#165），幂等（sync.Once，对齐仓内「组件
+// Close 统一 Close(ctx) error」生命周期硬规则）。此前探活 goroutine 只有
+// 「探活成功」一个出口：Redis 永久不可达且 limiter 被宿主丢弃时，goroutine
+// 及其引用的 limiter 永不回收，且每 100ms 对死服务器发起一次真实 EVAL 拨号。
+// Close 后 Redis 故障不再自动回切（探活停转），判定口径不变（Allow 照常：
+// Redis 可用走 Redis，故障走本地桶）；本类型的兜底是单只持续桶，无缓存可清。
+func (l *TokenLimiter) Close(_ context.Context) error {
+	l.stop()
+	return nil
 }

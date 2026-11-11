@@ -103,6 +103,21 @@
 // 兜底参数与 Redis 桶一致，故障窗口内的实际放行速率不变，仅失去跨实例全局
 // 精确性（各进程各自持有一个等参本地桶）。
 //
+// # 生命周期（#165/#167/#168）
+//
+//   - 构造期 fail-fast：[NewPeriodLimit]/[NewTokenLimiter] 对 quota/rate/burst/
+//     keyPrefix 非 nil store 逐项校验，非法值直接 panic（nil store 历史上
+//     不拦，故障延迟到首次判定的 nil interface panic，#168）；
+//   - 探活 watchdog 停机口：开启降级/兜底的限流器提供 Close(ctx) error
+//     （[PeriodLimit.Close]/[TokenLimiter.Close]/[ResilientLimiter.Close]，
+//     sync.Once 幂等）——Redis 永久不可达且限流器被宿主丢弃时，探活
+//     goroutine 随 Close 退出，不再永久轮询；Close 后故障不再自动回切；
+//   - 降级桶缓存随回切/Close 清理：探活成功回切或 Close 时清空进程内
+//     降级桶缓存（#167），高基数 key（per-user/per-token）不随一次长故障
+//     窗口沉淀全量条目常驻内存；
+//   - 降级桶工厂 per-key singleflight（#166）：并发首次降级只调一次工厂，
+//     与「每 key 只建一个桶」的承诺由实现保证而非注释。
+//
 // # 设计边界
 //
 //   - ctx-only API：所有判定方法首参收 context.Context，无历史包袱

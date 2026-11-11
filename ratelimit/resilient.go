@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -121,10 +122,14 @@ type ResilientLimiter struct {
 	failMode FailMode
 	// onFallback 经 WithFallbackMetrics 写入，判定路径只读。
 	onFallback func(Source)
-	// localCache 是 per-key 兜底桶缓存（#127）：key → LocalLimiter。判定路径
-	// 并发读写，sync.Map 保证「每个 key 只建一个桶、工厂只调一次」——否则
-	// Redis 故障期间每次判定都拿全新满桶，本地限流静默失效。
+	// localCache 是 per-key 兜底桶缓存（#127）：key → *bucketEntry。判定路径
+	// 并发读写，entry.once 把工厂调用收敛为 per-key singleflight（#166，
+	// 与 PeriodLimit.bucketFor 同一形态）——「每个 key 只建一个桶、工厂只调
+	// 一次」；回切/Close 时清空（#167，防高基数 key 长故障窗口后常驻内存）。
 	localCache sync.Map
+	// fallbackSeen 标记本次降级周期内建过桶（#167）：Redis 恢复的首次判定
+	// 用它做一次性的缓存清扫，常态（无降级）零开销。
+	fallbackSeen atomic.Bool
 }
 
 // NewResilientLimiter 创建组合限流器。
@@ -154,7 +159,9 @@ func NewResilientLimiter(dist *PeriodLimit, local func(key string) LocalLimiter,
 // Allow 请求一个配额，返回判定与依据。
 //
 // Redis 正常：(SourceRedis, nil)——Allowed/HitQuota 收敛为放行，OverQuota
-// 为拒绝（配额拒绝与故障降级经 Source 区分）；err 为 nil。
+// 为拒绝（配额拒绝与故障降级经 Source 区分）；err 为 nil。恢复后的首次
+// 判定清空本类型的降级桶缓存（#167：Redis 健康后进程内桶失去存在意义，
+// 高基数 key 不随一次长故障窗口常驻内存；常态无降级时零开销）。
 // Redis 故障（含 ctx 取消/超时——对本次请求而言「太慢」等同「挂了」）：
 //   - FailModeClosed：(SourceFailClosed, 底层 err)，一律拒绝；
 //   - FailModeOpen 且本地桶可用：(SourceLocalFallback, 底层 err)，按本地桶
@@ -167,10 +174,11 @@ func NewResilientLimiter(dist *PeriodLimit, local func(key string) LocalLimiter,
 func (l *ResilientLimiter) Allow(ctx context.Context, key string) (Decision, error) {
 	code, err := l.dist.Take(ctx, key)
 	switch code {
-	case Allowed, HitQuota:
-		return Decision{Allowed: true, Source: SourceRedis}, nil
-	case OverQuota:
-		return Decision{Allowed: false, Source: SourceRedis}, nil
+	case Allowed, HitQuota, OverQuota:
+		if l.fallbackSeen.CompareAndSwap(true, false) {
+			l.clearLocalCache()
+		}
+		return Decision{Allowed: code != OverQuota, Source: SourceRedis}, nil
 	default: // Unknown：Redis 通信失败或应答无法识别 → 降级口径单源（#118）
 		d := l.decideFallback(key)
 		return d, err
@@ -184,6 +192,7 @@ func (l *ResilientLimiter) decideFallback(key string) Decision {
 		return l.fallback(Decision{Allowed: false, Source: SourceFailClosed})
 	}
 	if l.local != nil {
+		l.fallbackSeen.Store(true) // #167：本降级周期建过桶，回切时清扫
 		if lim := l.localFor(key); lim != nil {
 			return l.fallback(Decision{
 				Allowed: lim.AllowN(time.Now(), 1),
@@ -197,17 +206,45 @@ func (l *ResilientLimiter) decideFallback(key string) Decision {
 // localFor 返回 key 对应的本地兜底桶，工厂结果按 key 缓存（#127）：每个 key
 // 只调一次工厂、跨请求共享同一桶实例——工厂返回新实例≠新桶，随用随建会让
 // Redis 故障期间的每个请求都拿到全新满桶，本地限流 100% 静默失效。
+// 工厂调用经 entry.once 收敛为 per-key singleflight（#166，与
+// PeriodLimit.bucketFor 同一形态）：并发首次降级不再重复调用工厂。
 // 工厂返回 nil 不缓存（保持「未提供该 key 的桶」的可动态语义）。
 func (l *ResilientLimiter) localFor(key string) LocalLimiter {
 	if v, ok := l.localCache.Load(key); ok {
-		return v.(LocalLimiter)
+		return v.(*bucketEntry).get()
 	}
-	lim := l.local(key)
+	build := func() LocalLimiter { return l.local(key) }
+	// Load miss 与 LoadOrStore 之间无同步也安全：落选者的 entry 因 once 未
+	// 触发而从未调用工厂，零副作用、即弃。
+	e := &bucketEntry{build: build}
+	actual, _ := l.localCache.LoadOrStore(key, e)
+	lim := actual.(*bucketEntry).get()
 	if lim == nil {
-		return nil
+		// 工厂返回 nil：该 key 的「无桶」结论不缓存。仅当缓存仍指向本条目
+		// 时删除（并发窗口里可能已有更新条目，不可误删）。
+		if cur, ok := l.localCache.Load(key); ok && cur == actual {
+			l.localCache.Delete(key)
+		}
 	}
-	actual, _ := l.localCache.LoadOrStore(key, lim)
-	return actual.(LocalLimiter)
+	return lim
+}
+
+// clearLocalCache 清空 per-key 兜底桶缓存（#167）。
+func (l *ResilientLimiter) clearLocalCache() {
+	l.localCache.Range(func(k, _ any) bool {
+		l.localCache.Delete(k)
+		return true
+	})
+}
+
+// Close 清空本类型的降级桶缓存（#167）并级联停掉底层 [PeriodLimit] 的探活
+// watchdog（#165），幂等。与 [PeriodLimit.Close] 同口径：Close 后 Redis 故障
+// 不再自动回切，判定口径不变；宿主不应再使用已 Close 的实例。
+func (l *ResilientLimiter) Close(ctx context.Context) error {
+	if l.fallbackSeen.CompareAndSwap(true, false) {
+		l.clearLocalCache()
+	}
+	return l.dist.Close(ctx)
 }
 
 // fallback 收口降级决策：观测钩子在此统一触发。

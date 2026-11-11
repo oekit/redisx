@@ -15,6 +15,9 @@ import (
 // defaultNullTTL 是 NullTTL 未设置（0）时的空值缓存默认 TTL。
 const defaultNullTTL = 1 * time.Minute
 
+// defaultTTL 是 RedisConfig.TTL 未设置（0）时的缺省缓存 TTL。
+const defaultTTL = 24 * time.Hour
+
 // RedisConfig 配置 Redis 缓存实例。
 type RedisConfig[T any] struct {
 	// Prefix key 前缀，如 "app:user:"。
@@ -189,10 +192,7 @@ func (c *RedisCache[T]) GetOrLoad(ctx context.Context, key string) (*T, error) {
 		return source, nil // 序列化失败仍返回数据
 	}
 
-	ttl := c.cfg.TTL
-	if ttl == 0 {
-		ttl = 24 * time.Hour
-	}
+	ttl := c.effectiveTTL()
 	if err := c.client.Set(ctx, c.fullKey(key), data, ttl).Err(); err != nil {
 		c.log.Error("set error", "key", key, logx.ErrKey, err)
 	}
@@ -225,12 +225,18 @@ func (c *RedisCache[T]) Set(ctx context.Context, key string, value *T) error {
 		return fmt.Errorf("cache serialize: %w", err)
 	}
 
-	ttl := c.cfg.TTL
-	if ttl == 0 {
-		ttl = 24 * time.Hour
-	}
+	return c.client.Set(ctx, fullKey, data, c.effectiveTTL()).Err()
+}
 
-	return c.client.Set(ctx, fullKey, data, ttl).Err()
+// effectiveTTL 返回本实例的生效 TTL（redisx#164，缺省口径单源）：
+// cfg.TTL == 0（未设置）→ 24h 缺省；> 0 原样。GetOrLoad 回填与 Set 两个
+// 写入口径从此编译期绑定同一实现，不再「注释里说口径一致」；与
+// SetWithTTL 的 ttl<=0 fail-fast（#113）的显式自定义口径边界不变。
+func (c *RedisCache[T]) effectiveTTL() time.Duration {
+	if c.cfg.TTL == 0 {
+		return defaultTTL
+	}
+	return c.cfg.TTL
 }
 
 // SetWithTTL 设置缓存（自定义 TTL）。

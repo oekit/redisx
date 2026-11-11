@@ -9,30 +9,38 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
+	pkgdistlock "github.com/oekit/pkg/distlock"
 	"github.com/redis/go-redis/v9"
 )
 
-// log 是包级缺省 logger（懒解析全局 Default）。#120 后 RedisLocker 的实例
-// 日志走 per-instance 的 l.log（缺省同样是 Delegating("distlock")，行为
-// 不变）；本变量仅剩接口层入口 WithLock 对**未实现 instanceLogger** 的
-// Locker 实现兜底时使用。
+// log 是包级缺省 logger（懒解析全局 Default）。#120 后 RedisLocker 与
+// Semaphore 的实例日志走 per-instance 的 l.log / s.log（缺省同样是
+// Delegating("distlock")，行为不变）；本变量是零值实例（未经构造器）时
+// logr() 的兜底。WithLock 释放失败的告警已随契约单源上提 pkg（etcdx#123，
+// 走 log/slog），不再经本变量。
 var log = logx.Delegating("distlock")
 
-// ErrLockNotAcquired 表示锁被其他实例持有，获取失败。
-var ErrLockNotAcquired = errors.New("lock not acquired")
+// 哨兵错误集（etcdx#123 契约单源后改为**别名**指向 [pkgdistlock] 的同一套
+// 值——同进程只此一套哨兵，下游用本包或 pkg 侧任一写法 errors.Is 都命中，
+// 两仓各自 errors.New 造成的「同文案不同值、跨包判定恒 false」从此不可能；
+// 文案以本仓历史为基准，逐字不变）。变量仍保存在本包名下：既有调用方的
+// `distlock.ErrLockTimeout` 等引用零改动。
+var (
+	// ErrLockNotAcquired 表示锁被其他实例持有，获取失败。
+	ErrLockNotAcquired = pkgdistlock.ErrLockNotAcquired
 
-// ErrLockTimeout 表示在指定超时时间内未能获取锁。
-var ErrLockTimeout = errors.New("lock acquire timeout")
+	// ErrLockTimeout 表示在指定超时时间内未能获取锁。
+	ErrLockTimeout = pkgdistlock.ErrLockTimeout
 
-// ErrLockNotHeld 表示解锁时锁不存在或已易主——本次 Unlock **没有删除任何锁**
-// （#115）。典型成因：锁 TTL 过期后已被他人重新获取、或对同一 (key, ownerID)
-// 重复 Unlock。与 [Renew] 返回 (false, nil) 的「锁已丢失」语义对齐：调用方
-// 收到本哨兵即说明自己已不再持有锁，**不得继续在临界区内工作**（继续执行会
-// 与新持有者并发）；errors.Is 判定，与其它 Redis 错误（可重试的通信故障）
-// 区分。
-var ErrLockNotHeld = errors.New("lock not held by this owner")
+	// ErrLockNotHeld 表示解锁时锁不存在或已易主——本次 Unlock **没有删除任何锁**
+	// （#115）。典型成因：锁 TTL 过期后已被他人重新获取、或对同一 (key, ownerID)
+	// 重复 Unlock。与 [Renew] 返回 (false, nil) 的「锁已丢失」语义对齐：调用方
+	// 收到本哨兵即说明自己已不再持有锁，**不得继续在临界区内工作**（继续执行会
+	// 与新持有者并发）；errors.Is 判定，与其它 Redis 错误（可重试的通信故障）
+	// 区分。
+	ErrLockNotHeld = pkgdistlock.ErrLockNotHeld
+)
 
 var unlockScript = redis.NewScript(`
 	if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -60,16 +68,6 @@ var renewScript = redis.NewScript(`
 		return 0
 	end
 `)
-
-// lockState 管理单个锁的自动续期状态（per-key 隔离）。
-// ownerID 记录本状态对应的锁持有者，Unlock 时校验，
-// 防止超时后的陈旧持有者误杀新持有者的续期。
-type lockState struct {
-	ownerID  string
-	stopChan chan struct{}
-	cancel   context.CancelFunc
-	once     sync.Once
-}
 
 // RedisLocker 是基于 Redis 的分布式锁实现。
 type RedisLocker struct {
@@ -197,8 +195,8 @@ func NewRedisLocker(client redis.UniversalClient, opts ...RedisLockerOption) *Re
 	return l
 }
 
-// logr 返回本实例的 logger（#120 的 instanceLogger 契约，供 WithLock 等
-// 接口层入口取用）；零值实例（未经构造器）兜底回包级缺省，绝不 nil。
+// logr 返回本实例的 logger（#120，watchdog 告警取用）；零值实例（未经
+// 构造器）兜底回包级缺省，绝不 nil。
 func (l *RedisLocker) logr() logx.Logger {
 	if l.log != nil {
 		return l.log
@@ -332,17 +330,13 @@ func (l *RedisLocker) Unlock(ctx context.Context, key string, ownerID string) er
 
 // stopRenewState 清理 key 对应的续期状态：只停/只删属于 ownerID 的状态；
 // 属于他人（锁易主后新持有者）的状态原样回填，绝不误杀。LoadOrStore 回填
-// 保证不覆盖窗口期新存入的第三个状态。
+// 保证不覆盖窗口期新存入的第三个状态。stop 收尾（once.Do cancel+close）单源
+// 在 [stopRenewState]（#159，watchdog 状态机包内单源）。
 func (l *RedisLocker) stopRenewState(key string, ownerID string) {
 	if v, ok := l.locks.LoadAndDelete(key); ok {
 		cur := v.(*lockState)
 		if cur.ownerID == ownerID {
-			cur.once.Do(func() {
-				if cur.cancel != nil {
-					cur.cancel()
-				}
-				close(cur.stopChan)
-			})
+			stopState(cur)
 		} else {
 			l.locks.LoadOrStore(key, cur)
 		}
@@ -448,26 +442,15 @@ func (l *RedisLocker) Lock(ctx context.Context, key string, ttl time.Duration, t
 // 每次 Lock 成功时创建独立的 lockState，per-key 隔离。
 // 使用独立的 derived context，续期生命周期与锁绑定而非调用方 context。
 //
+// 状态机本体（Swap-停旧、interval 推导、maxLifetime 三态、goroutine 循环）
+// 单源在包内 [renewWatchdog]（#159）：#33/#39 两个历史修复从此只有一份，
+// 本方法只注入 Redis 侧 renew 闭包与告警文案。
+//
 // 续期受最大生命周期约束（WithMaxAutoRenew，默认 10×ttl）：到期后
 // goroutine 退出并记 Warn，锁在 TTL 后自然过期 —— 防止忘记 Unlock
 // 导致永久持锁与 goroutine 泄漏（TTL 安全网重新生效）。
 func (l *RedisLocker) startAutoRenew(_ context.Context, key string, ownerID string, ttl time.Duration) {
-	renewCtx, cancel := context.WithCancel(context.Background())
-	st := &lockState{ownerID: ownerID, stopChan: make(chan struct{}), cancel: cancel}
-	// 覆盖旧 state 前先停掉它（防御性，#33）：同一 key 的旧 state 若仍在续期，
-	// 它的 goroutine 只能等下一个 tick 才发现锁已不属于自己 —— 既泄漏 goroutine，
-	// 又打出误导性的 "auto renew failed: lock lost or not owned"。新获取锁成功
-	// （SetNX 通过）意味着旧持有者的锁已不存在，停掉旧续期是安全的。
-	if old, ok := l.locks.Swap(key, st); ok {
-		if prev, ok := old.(*lockState); ok {
-			prev.once.Do(func() {
-				if prev.cancel != nil {
-					prev.cancel()
-				}
-				close(prev.stopChan)
-			})
-		}
-	}
+	w := newRenewWatchdog(&l.locks, key, ownerID)
 
 	// graceful 降级模式没有真锁，也无从续期；只注册状态保持
 	// Lock/Unlock 状态机对称，不启动 goroutine（否则每 tick nil client panic）。
@@ -475,72 +458,23 @@ func (l *RedisLocker) startAutoRenew(_ context.Context, key string, ownerID stri
 		return
 	}
 
-	interval := l.renewInterval
-	if interval <= 0 {
-		interval = ttl / 2
-		if interval < time.Millisecond {
-			// 亚毫秒 TTL：续期量化的下限是 1ms（ttlMillis）⇒ 间隔也取
-			// 1ms 下限，否则会起一个 250µs 的高频 ticker 空转。
-			// 只在**由 ttl 推导**时收紧；显式 WithRenewInterval 不动。
-			interval = time.Millisecond
+	w.interval = renewIntervalFrom(l.renewInterval, ttl)
+	w.maxLifetime = renewMaxLifetime(l.maxAutoRenew, ttl)
+	w.renew = func(ctx context.Context) (bool, error) {
+		result, err := renewScript.Run(ctx, l.client, []string{l.lockKey(key)}, ownerID, ttlMillis(ttl)).Int()
+		if err != nil {
+			return false, err
 		}
+		return result == 1, nil
 	}
-	if interval <= 0 {
-		interval = 1 * time.Second
+	w.onRetryErr = func(err error) {
+		l.logr().Warn("auto renew failed, will retry", "key", key, logx.ErrKey, err)
 	}
-
-	// 计算续期最大生命周期：0（未设置）= 10×ttl；负值 = 不限制（0 表示无 deadline）。
-	maxLifetime := l.maxAutoRenew
-	switch {
-	case maxLifetime == 0:
-		maxLifetime = 10 * ttl
-	case maxLifetime < 0:
-		maxLifetime = 0
+	w.onLost = func() {
+		l.logr().Warn("auto renew failed: lock lost or not owned", "key", key)
 	}
-	stopChan := st.stopChan
-
-	async.GoSafe(func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-
-		// 计时器必须在 goroutine 内部创建并停止（#39）：defer 是函数级的，
-		// 放在 startAutoRenew 里会在函数返回的瞬间就 Stop 掉计时器 ——
-		// 派发完 goroutine 后本函数立刻返回 ⇒ lifetimeC 永不就绪 ⇒
-		// 下面 `case <-lifetimeC` 是死代码 ⇒ WithMaxAutoRenew 安全网
-		// （默认 10×ttl）从未生效，锁被无限续期。
-		var lifetimeTimer *time.Timer
-		var lifetimeC <-chan time.Time
-		if maxLifetime > 0 {
-			lifetimeTimer = time.NewTimer(maxLifetime)
-			defer lifetimeTimer.Stop()
-			lifetimeC = lifetimeTimer.C
-		}
-
-		for {
-			select {
-			case <-renewCtx.Done():
-				return
-			case <-stopChan:
-				return
-			case <-lifetimeC:
-				// 达到最大续期生命周期：放弃续期，锁将在 TTL 后自然过期。
-				// 这是忘记 Unlock 时的安全网（默认 10×ttl）。
-				l.logr().Warn("auto renew exceeded max lifetime, giving up lock", "key", key, "max_lifetime", maxLifetime)
-				return
-			case <-ticker.C:
-				result, err := renewScript.Run(renewCtx, l.client, []string{l.lockKey(key)}, ownerID, ttlMillis(ttl)).Int()
-				if err != nil {
-					// 瞬时错误（网络抖动、failover）不放弃：下一个 tick 重试。
-					// 续期 goroutine 一旦退出，锁将在 TTL 后静默失效。
-					l.logr().Warn("auto renew failed, will retry", "key", key, logx.ErrKey, err)
-					continue
-				}
-
-				if result == 0 {
-					l.logr().Warn("auto renew failed: lock lost or not owned", "key", key)
-					return
-				}
-			}
-		}
-	})
+	w.onGaveUp = func(maxLifetime time.Duration) {
+		l.logr().Warn("auto renew exceeded max lifetime, giving up lock", "key", key, "max_lifetime", maxLifetime)
+	}
+	w.startAutoRenew()
 }
