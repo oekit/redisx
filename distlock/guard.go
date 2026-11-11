@@ -39,6 +39,14 @@ type GuardConfig struct {
 	// 降级放行会静默失效，调用方显式取舍；与 Lockout/Semaphore 的
 	// fail-fast 口径一致）。
 	MemFallback bool
+	// MemMaxEntries 是进程内降级层的容量护栏上限（redisx#157：防用户名
+	// 枚举撑爆内存——降级层以业务 key（如 username）为键，攻击者枚举 key
+	// 时每次 RecordFail 都新增一条目，无上限即内存无界增长）。0 = 不限
+	// （兼容既有调用方，对齐 concrl.LockoutConfig.MaxEntries 缺省）；
+	// >0 时表满丢新样本 fail-open（已登记 key 不受影响）。
+	// 防爆破场景**建议显式设置**（如 100_000）：护栏语义是「宁可漏记一个
+	// 攻击者，不把进程内存交给攻击者的枚举速度」。
+	MemMaxEntries int
 }
 
 // BruteForceGuard 是「防爆破锁对」的一等组合口（#128）：分布式主实现
@@ -109,6 +117,7 @@ func (g *BruteForceGuard) memFor() *concrl.Lockout {
 			Window:       g.cfg.Window,
 			Threshold:    g.cfg.MaxFails,
 			LockDuration: g.cfg.LockTTL,
+			MaxEntries:   g.cfg.MemMaxEntries, // redisx#157：容量护栏透传（0=不限）
 			Now:          g.memNow,
 		})
 	})

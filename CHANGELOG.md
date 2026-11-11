@@ -1,3 +1,7 @@
+## [v0.14.1] — 2026-11-11
+
+- fix(distlock): BruteForceGuard 的进程内降级层补容量护栏 MemMaxEntries（#157）——降级层以业务 key（如 username）为键，攻击者枚举 key 时每次 RecordFail 都新增条目、内存无界（下游手搓装配显式设 100k 护栏，#128 收编组合口时丢失）。0 = 不限（兼容既有调用方）；>0 时表满丢新样本 fail-open（已登记 key 不受影响，OverCapHits 观测），防爆破场景建议显式设置。
+
 ## [v0.14.0] — 2026-11-11
 
 - feat(client)!: Client.Close 统一 `Close(ctx) error` + sync.Once 幂等（#148）——⚠️ BREAKING 签名变更。修复前 `Close() error` 两处违反本仓生命周期硬规则（AGENTS.md「组件 Close 统一 Close(ctx) error 签名 + sync.Once 幂等」）：① 无 ctx 参数，停机流程无法给关闭动作设期限；② 无幂等保护，直接透传 go-redis `baseClient.Close()`（ConnPool CAS 判重），「显式 Close + defer Close」双路径/多持有者各自 Close 时第二次拿到 `redis: client is closed`，正常重复关闭被调用方当成关闭失败上报（issue 探针实测）。修复后 sync.Once 缓存**首次**关闭结果：底层连接池只真正关一次、重复调用稳定返回同一结果（成功即恒 nil），与 etcdx.Client.Close(ctx) 同形——矩阵内「Close(ctx) 幂等」先例补齐 redisx 漏项。回归：TestClient_Close_Idempotent（连续 Close 两次第二次必须 nil——修复前透传 redis.ErrClosed 实测红）、TestClient_Close_CachesFirstResult（首次 error 缓存返回、底层只关一次）、TestClient_Close_SuccessStaysNil

@@ -110,6 +110,53 @@ func TestBruteForceGuard_MemFallbackOnRedisFailure(t *testing.T) {
 	}
 }
 
+// TestBruteForceGuard_MemMaxEntriesCapacityCap 钉住 redisx#157：进程内降级层
+// 的容量护栏（MemMaxEntries）真实生效——表满后新 key 的失败样本被丢弃
+// （fail-open，内存不随攻击者的枚举速度增长），已登记 key 的计数不受影响。
+// 无护栏时攻击者枚举 key（如用户名）每次 RecordFail 都新增条目，内存无界。
+func TestBruteForceGuard_MemMaxEntriesCapacityCap(t *testing.T) {
+	mr := miniredis.RunT(t)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	g := NewBruteForceGuard(c, GuardConfig{
+		KeyPrefix:     "zeus:lockout:",
+		MaxFails:      3,
+		Window:        10 * time.Minute,
+		LockTTL:       30 * time.Minute,
+		MemFallback:   true,
+		MemMaxEntries: 2, // 护栏：表容量 2
+	})
+	ctx := context.Background()
+	mr.Close() // 走进程内降级层
+
+	// 登满两条目（u1/u2 各一次失败——条目已登记）
+	for _, k := range []string{"user:1", "user:2"} {
+		if _, err := g.Fail(ctx, k); err != nil {
+			t.Fatalf("seed fail %s: %v", k, err)
+		}
+	}
+	// 枚举新 key：表满丢样本 fail-open——既不报错也不锁（样本被丢弃）
+	for i := 0; i < 5; i++ {
+		locked, err := g.Fail(ctx, "user:attacker-enum")
+		if err != nil {
+			t.Fatalf("over-cap fail must fail-open without error (i=%d): %v", i, err)
+		}
+		if locked {
+			t.Fatalf("over-cap samples must be dropped, never accumulate to lock (i=%d)", i)
+		}
+	}
+	// 已登记 key 不受影响：u1 的后续失败照常累计并触发锁定
+	for i := 2; i <= 3; i++ {
+		locked, err := g.Fail(ctx, "user:1")
+		if err != nil {
+			t.Fatalf("registered key fail %d: %v", i, err)
+		}
+		if locked != (i == 3) {
+			t.Fatalf("registered key fail %d locked=%v, want %v", i, locked, i == 3)
+		}
+	}
+}
+
 // TestBruteForceGuard_MemFallbackOffSurfacesError 负对照：MemFallback 关闭时
 // Redis 故障原样上抛（防爆破语义降级放行会静默失效，调用方显式取舍）。
 func TestBruteForceGuard_MemFallbackOffSurfacesError(t *testing.T) {
