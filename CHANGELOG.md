@@ -8,7 +8,7 @@
 - fix(ratelimit): #166 降级桶工厂 per-key singleflight——`PeriodLimit.bucketFor`/`ResilientLimiter.localFor` 的 Load-then-LoadOrStore 之间无同步，并发首次降级重复调用工厂、落选者桶实例被丢弃，与「工厂只调一次（#127）」承诺不符（自定义工厂带副作用/计数时语义漂移）；改为 `bucketEntry{once, build}` 条目，once 收敛工厂调用（落选者零副作用即弃），工厂返回 nil 的「不缓存、下次再调」动态语义保持。回归：32 并发首次降级工厂恰调 1 次（两实现）
 - fix(ratelimit): #167 降级桶缓存无界增长——回切成功（探活钩子 onRecover / ResilientLimiter 首次 SourceRedis 判定，fallbackSeen 常态零开销）与 Close 时清空 `PeriodLimit.buckets`/`ResilientLimiter.localCache`：高基数 key（per-user/per-token）一次长故障窗口不再沉淀全量条目常驻内存；新故障周期重建桶（工厂按周期重调，语义诚实化）。回归：回切后缓存清零 + 新周期工厂再调；Close 幂等清理
 - fix(ratelimit): #168 `NewPeriodLimit`/`NewTokenLimiter` 构造期校验 store 非 nil（直接 panic，与同函数既有 fail-fast 口径一致）——此前 nil store 不拦，故障延迟到首次判定的 nil interface panic 且堆栈落在 go-redis 内部帧，排查路径同「构造时忘传 client」。⚠️ BREAKING（构造期）：以 nil store 构造的调用方从「首次 Take panic」提前到「构造期 panic」（同样 fail-fast，时机前移），正常构造零影响
-- build: Go 地板保持 `go 1.26.0`（ci.yml go-version '1.26' 成对无变更）；依赖 `github.com/oekit/pkg` v0.44.0 → **v0.45.0**（distlock 契约单源）。现代语言特性：sync.Map.Clear（Go 1.24+）用于桶缓存清理、atomic.Bool 用于一次性清扫标记
+- build: Go 地板保持 `go 1.26.0`（ci.yml go-version '1.26' 成对无变更）；依赖地板对齐最新已发布版本：`github.com/oekit/pkg` v0.44.0 → **v0.45.0**（distlock 契约单源）、`logx` v0.9.2 → **v0.10.0**、`concurrency` v0.33.0 → **v0.34.0**（release_train 地板门禁）。现代语言特性：sync.Map.Clear（Go 1.24+）用于桶缓存清理、atomic.Bool 用于一次性清扫标记
 
 关联问题单：redisx#159、redisx#161、redisx#162、redisx#163、redisx#164、redisx#165、redisx#166、redisx#167、redisx#168。
 
