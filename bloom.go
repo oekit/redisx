@@ -103,7 +103,7 @@ func (bf *BloomFilter) Info(ctx context.Context) (map[string]any, error) {
 	}
 
 	val := cmd.Val()
-	arr, ok := val.([]interface{})
+	arr, ok := val.([]any)
 	if !ok {
 		return nil, fmt.Errorf("unexpected BF.INFO response type: %T", val)
 	}

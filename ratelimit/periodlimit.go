@@ -178,6 +178,16 @@ func NewPeriodLimit(period time.Duration, quota int64, store redis.Scripter, key
 	return l
 }
 
+// Rescue 返回本实例的降级档位（构造期经 [WithRescue] 写入后的只读判据，
+// redisx#173）：[NewResilientLimiter] 构造期用它拦截「rescue 降级 + 弹性
+// 外壳」叠配——dist 自带降级时 Take 的故障路径恒返回 (非 Unknown, nil)，
+// ResilientLimiter 永远看不到 Unknown，其 FailMode（尤其 FailModeClosed 的
+// fail-closed 语义）被静默旁路、Decision.Source 恒报 SourceRedis（#118
+// 观测面失真）。需要弹性外壳时 dist 必须保持 RescueOff（默认）。
+func (l *PeriodLimit) Rescue() RescueMode {
+	return l.rescue
+}
+
 // Take 请求一个配额，返回判定结果。
 //
 // 返回 (Allowed|HitQuota|OverQuota, nil) 表示 Redis 判定成功（或已按

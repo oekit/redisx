@@ -409,6 +409,45 @@ func TestBatch_Exec(t *testing.T) {
 	}
 }
 
+// TestPipeline_Discard_AfterExec_SafeNoOp 回归（redisx#169 复核口径）：对已
+// Exec 的管道再 Discard 是安全 no-op——go-redis v9 的 Pipeliner.Discard 无
+// 返回值（仅重置 cmds 切片，pipeline.go:94-96），「已 Exec 后 Discard 报
+// 'pipeliner has been executed'」是 v8 行为，v9 无此错误面，包装无可透传
+// 的 error。钉住：Exec 后 Discard 不 panic、队列归零、且不会把已执行的命令
+// 再投递一遍（重复 Exec 只拿到空结果）。
+func TestPipeline_Discard_AfterExec_SafeNoOp(t *testing.T) {
+	c, _ := newTestClient(t, "")
+	ctx := context.Background()
+
+	p := c.Pipeline()
+	p.Set(ctx, "discard:no-op", "v", time.Minute)
+	if _, err := p.Exec(ctx); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if p.Len() != 0 {
+		t.Fatalf("queue must be drained after Exec, len=%d", p.Len())
+	}
+
+	p.Discard() // 已 Exec 的管道上 Discard：不得 panic
+	if p.Len() != 0 {
+		t.Fatalf("queue must stay empty after post-Exec Discard, len=%d", p.Len())
+	}
+	if _, err := c.Get(ctx, "discard:no-op").Result(); err != nil {
+		t.Fatalf("previously executed command's effect must persist: %v", err)
+	}
+
+	// Batch 委托同一 [Pipeline]，同口径。
+	b := c.NewBatch()
+	b.Set(ctx, "discard:no-op-2", "v", time.Minute)
+	if _, err := b.Exec(ctx); err != nil {
+		t.Fatalf("batch exec: %v", err)
+	}
+	b.Discard()
+	if b.Len() != 0 {
+		t.Fatalf("batch queue must stay empty after post-Exec Discard, len=%d", b.Len())
+	}
+}
+
 func TestCounter_HighLevel(t *testing.T) {
 	// 用空 prefix 避免 Counter 内部对 key 加 prefix 跟测试期待不一致。
 	c, _ := newTestClient(t, "")

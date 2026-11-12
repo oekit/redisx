@@ -267,7 +267,15 @@ func (c *RedisCache[T]) SetWithTTL(ctx context.Context, key string, value *T, tt
 // 写入精确等于哨兵的字节会被读路径按 null marker 处理（Get/GetBytes 返回
 // nil、GetOrLoad 不回源）；写入其他 \x00 开头值属违反契约，不认作 null，
 // 走反序列化（默认 JSON 下报错）。
+//
+// ttl 必须 > 0，<=0 返回错误（redisx#172，与 [RedisCache.SetWithTTL] 的 #113
+// 护栏同口径）：go-redis 对 TTL=0 不下发 EX ⇒ 静默写成永久键——显式自定义
+// ttl 的入口对零值笔误（漏传时长/时长变量未初始化）一律响亮拒绝，不猜缺省
+// 也不写永久键。
 func (c *RedisCache[T]) SetRaw(ctx context.Context, key string, data []byte, ttl time.Duration) error {
+	if ttl <= 0 {
+		return fmt.Errorf("cache SetRaw: ttl 必须 > 0（得到 %s）——0 会经 go-redis 写成永久键，与 Set 的 24h 缺省口径冲突（#113/#172）", ttl)
+	}
 	return c.client.Set(ctx, c.fullKey(key), data, ttl).Err()
 }
 

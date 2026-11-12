@@ -17,7 +17,11 @@ import (
 //     空闲 key 自然消亡，与并发 Lockout 的条目回收对齐）；
 //   - count >= threshold 时 SET NX PX 置锁定标记——NX 保证**惩罚时长只按首次
 //     触发计算**，后续失败不延长（与 concurrency/ratelimit.Lockout 语义一致）；
-//     锁定标记过期后窗口内旧失败仍在，下一次 Fail 即重新锁定（重复违规者）。
+//     锁定标记过期后窗口内旧失败仍在，下一次 Fail 即重新锁定（重复违规者）；
+//   - 返回 {count, locked}（redisx#171）：locked = EXISTS KEYS[2]，锁定态的
+//     唯一判定口径是脚本侧锁定标记（SET PX penalty），不是「count >= 阈值」
+//     ——LockTTL > Window 时窗口滑动后旧失败出窗，计数跌破阈值而锁定标记
+//     PTTL 未到期，按计数复刻判定会在活跃锁定内误报「未锁定」。
 var lockoutFailScript = redis.NewScript(`
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', tonumber(ARGV[1]) - tonumber(ARGV[2]))
 local seq = redis.call('INCR', KEYS[3])
@@ -28,7 +32,8 @@ local count = redis.call('ZCARD', KEYS[1])
 if count >= tonumber(ARGV[3]) then
 	redis.call('SET', KEYS[2], '1', 'PX', ARGV[4], 'NX')
 end
-return count
+local locked = redis.call('EXISTS', KEYS[2])
+return {count, locked}
 `)
 
 // lockoutCheckScript 锁定标记剩余毫秒数（>0 = 锁定中）。
@@ -143,13 +148,30 @@ func (l *Lockout) Fail(ctx context.Context, key string) (int64, error) {
 	if err := l.validate(); err != nil {
 		return 0, err
 	}
-	n, err := lockoutFailScript.Run(ctx, l.client, l.keys(key),
+	n, _, err := l.failState(ctx, key)
+	return n, err
+}
+
+// failState 执行 lockoutFailScript，返回窗口计数与锁定态（redisx#171）：
+// locked 以脚本侧锁定标记（EXISTS KEYS[2]）为准——BruteForceGuard.Fail 的
+// 返回值唯一口径，Go 侧不再按「count >= 阈值」复刻判定。
+func (l *Lockout) failState(ctx context.Context, key string) (int64, bool, error) {
+	res, err := lockoutFailScript.Run(ctx, l.client, l.keys(key),
 		l.now().UnixMilli(), ttlMillis(l.cfg.Window), l.cfg.Threshold,
-		ttlMillis(l.cfg.Penalty)).Int64()
+		ttlMillis(l.cfg.Penalty)).Result()
 	if err != nil {
-		return 0, fmt.Errorf("redis lockout fail failed: %w", err)
+		return 0, false, fmt.Errorf("redis lockout fail failed: %w", err)
 	}
-	return n, nil
+	vals, ok := res.([]any)
+	if !ok || len(vals) != 2 {
+		return 0, false, fmt.Errorf("redis lockout fail: unexpected reply %v", res)
+	}
+	count, _ := vals[0].(int64)
+	locked := false
+	if v, ok := vals[1].(int64); ok && v == 1 {
+		locked = true
+	}
+	return count, locked, nil
 }
 
 // Check 查询 key 是否处于锁定拒绝态：locked=true 时 remain 为剩余锁定时长

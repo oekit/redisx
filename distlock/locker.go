@@ -388,6 +388,10 @@ func ttlMillis(ttl time.Duration) int64 {
 
 // Lock 带超时重试地获取分布式锁（阻塞直到成功或超时）。
 // 重试间隔由 WithRetryInterval 配置（默认 100ms）。
+// timeout 是**严格上界**（redisx#178，与 etcdx 侧 context.WithTimeout 的
+// 封顶语义对齐）：到点后不再投递新的抢锁尝试，锁即便在超时后才变为可获取
+// 也返回 ErrLockTimeout——「超时后返回成功」不存在。timeout=0 仍保留一次
+// 非阻塞尝试（两后端对齐面，同 etcdx）。
 // 如果启用了自动续期，成功获取锁后会启动续期 goroutine
 // （由 TryLock 统一负责，避免同一把锁重复启动续期，#33）。
 // 返回 (ownerID, nil) 表示成功。
@@ -434,6 +438,16 @@ func (l *RedisLocker) Lock(ctx context.Context, key string, ttl time.Duration, t
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-ticker.C:
+		}
+
+		// redisx#178：睡醒后若已越过 deadline，下一轮抢锁投递前封口——
+		// 不再投递新的尝试，直接超时返回。deadline 只在失败之后检查时，
+		// 锁在超时后才释放的形态（如 timeout=50ms、重试间隔 300ms、他方
+		// 120ms 释放）会在 302ms 抢到并返回成功，timeout 不是上界；与
+		// etcdx 的 context.WithTimeout 严格封顶语义对齐后，同一接口两后端
+		// 「超时后还能不能成功」的答案一致：不能。
+		if time.Now().After(deadline) {
+			return "", ErrLockTimeout
 		}
 	}
 }

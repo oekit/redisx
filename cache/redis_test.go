@@ -853,3 +853,51 @@ func TestRedisCache_SetWithTTL_PositiveTTLHasExpiry(t *testing.T) {
 		t.Fatalf("positive TTL write must carry an expiry, got %s", ttl)
 	}
 }
+
+// TestRedisCache_SetRaw_GuardAgainstZeroTTL 表驱动（redisx#172）：SetRaw 是
+// SetWithTTL 的姊妹入口，#113 的护栏曾单侧漏掉它——ttl<=0 静默写永久键。
+// 修复后与 SetWithTTL 同口径 fail-fast：报错、绝不落键。
+func TestRedisCache_SetRaw_GuardAgainstZeroTTL(t *testing.T) {
+	cases := []struct {
+		name string
+		ttl  time.Duration
+	}{
+		{"zero is permanent-key typo", 0},
+		{"negative is also invalid", -1 * time.Second},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			client, mr := newTestRedisClient(t)
+			rc := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "x:"})
+			ctx := context.Background()
+
+			err := rc.SetRaw(ctx, "k", []byte("raw-bytes"), c.ttl)
+			if err == nil {
+				t.Fatalf("SetRaw(ttl=%s) 必须返回错误（redisx#172）", c.ttl)
+			}
+			if !strings.Contains(err.Error(), "ttl") {
+				t.Fatalf("错误信息必须指明 ttl 非法，got: %v", err)
+			}
+			// 关键反断言：报错路径不得留下任何键（尤其不得是永久键）。
+			if mr.Exists("x:k") {
+				t.Fatalf("SetRaw(ttl=%s) 报错后不得落键（旧实现落永久键，redisx#172）", c.ttl)
+			}
+		})
+	}
+}
+
+// TestRedisCache_SetRaw_PositiveTTLHasExpiry 钉住正 TTL 路径不受护栏影响：
+// 写入成功且键带过期时间（miniredis TTL > 0），不是永久键。
+func TestRedisCache_SetRaw_PositiveTTLHasExpiry(t *testing.T) {
+	client, mr := newTestRedisClient(t)
+	rc := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "x:"})
+	ctx := context.Background()
+
+	if err := rc.SetRaw(ctx, "k", []byte("raw-bytes"), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	ttl := mr.TTL("x:k")
+	if ttl <= 0 {
+		t.Fatalf("positive TTL write must carry an expiry, got %s", ttl)
+	}
+}
