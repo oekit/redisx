@@ -84,6 +84,9 @@ func (b *Batch) Len() int {
 }
 
 // Discard 丢弃批量操作中的所有命令。
+//
+// 签名保持 void（与 [Pipeline.Discard] 同口径，redisx#169 复核结论）：
+// go-redis v9 的 Pipeliner.Discard 无返回值、恒成功，无可透传的 error。
 func (b *Batch) Discard() {
 	b.p.Discard()
 }

@@ -40,6 +40,13 @@ func (p *Pipeline) Exec(ctx context.Context) ([]redis.Cmder, error) {
 }
 
 // Discard 丢弃管道中尚未执行的命令。
+//
+// 签名保持 void 不是吞错误（redisx#169 复核结论）：go-redis v9 的
+// Pipeliner.Discard 本身无返回值（pipeline.go:94-96，仅重置 cmds 切片，
+// 恒成功）——「已 Exec 的管道 Discard 报 'pipeliner has been executed'」
+// 是 v8 的行为，v9 已删除该错误面。本包装没有可透传的 error，无 error
+// 可忽略即不违反「error 禁止忽略」硬规则；对已 Exec 管道再 Discard 是
+// 安全 no-op（队列本已为空），测试钉住该口径。
 func (p *Pipeline) Discard() {
 	p.pipe.Discard()
 }

@@ -231,6 +231,55 @@ func TestBruteForceGuard_CtxCancelNotDegraded(t *testing.T) {
 	}
 }
 
+// TestBruteForceGuard_FailLockedAfterWindowSlide 回归（redisx#171）：LockTTL
+// > Window 时，窗口滑动后活跃锁定内的 Fail 不得误报「未锁定」。旧实现按
+// 「本次窗口计数 >= 阈值」复刻锁定判定——窗口滑走后旧失败出窗，第 N+1 次
+// Fail 返回 count=1 → 1>=N 为 false，而 Check（锁定标记 PTTL 未到期）仍报
+// locked=true；按包文档 `if locked, _ := guard.Fail(ctx, ...); locked` 门控
+// 的调用方会放过处于拒绝态的请求。修复后 Fail 的锁定态以脚本侧锁定标记
+// （SET PX penalty 的存在性）为唯一口径，与 Check 同源。
+func TestBruteForceGuard_FailLockedAfterWindowSlide(t *testing.T) {
+	// 短窗口（300ms）+ 长锁定（5s）构造 LockTTL > Window 的脱节形态，
+	// 真实时钟即可跨过窗口，不依赖时钟注入。
+	mr := miniredis.RunT(t)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	g := NewBruteForceGuard(c, GuardConfig{
+		KeyPrefix: "zeus:lockout:",
+		MaxFails:  3,
+		Window:    300 * time.Millisecond,
+		LockTTL:   5 * time.Second,
+	})
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		locked, err := g.Fail(ctx, "user:42")
+		if err != nil {
+			t.Fatalf("fail %d: %v", i, err)
+		}
+		if locked != (i == 2) {
+			t.Fatalf("fail %d locked = %v, want %v", i, locked, i == 2)
+		}
+	}
+	if locked, _, err := g.Check(ctx, "user:42"); err != nil || !locked {
+		t.Fatalf("precondition: Check after trip = (%v, %v), want locked", locked, err)
+	}
+
+	// 窗口滑走（旧失败全部出窗）而锁定标记仍在（PTTL 未到期）。
+	time.Sleep(350 * time.Millisecond)
+
+	locked, err := g.Fail(ctx, "user:42")
+	if err != nil {
+		t.Fatalf("fail after slide: %v", err)
+	}
+	if !locked {
+		t.Fatal("Fail inside active lock after window slide must report locked (redisx#171)")
+	}
+	if locked, _, err := g.Check(ctx, "user:42"); err != nil || !locked {
+		t.Fatalf("Check after slide = (%v, %v), want still locked", locked, err)
+	}
+}
+
 // TestBruteForceGuard_ValidationFailFast 配置/参数非法在使用时报错不 panic
 // （与 distlock 其余入口的 fail-fast 口径一致；nil client 即便开了
 // MemFallback 也属配置错误，不得静默退化成纯进程内防爆破）。

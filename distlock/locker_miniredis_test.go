@@ -526,3 +526,78 @@ func TestUnlock_DoubleUnlock_SecondReportsNotHeld(t *testing.T) {
 		t.Fatalf("second unlock must report ErrLockNotHeld (#115), got %v", err)
 	}
 }
+
+// TestLock_TimeoutIsStrictUpperBound 回归（redisx#178）：timeout 是严格上界，
+// 到点后不再投递新的抢锁尝试——锁在超时之后才释放的场景必须返回
+// ErrLockTimeout，不得「超时后抢到并返回成功」。实测形态：timeout=50ms、
+// retryInterval=300ms、他方持锁并于 120ms 释放 ⇒ 旧实现（deadline 只在失败
+// 之后检查）在 302ms 抢到并返回 nil，与 etcdx 侧 context.WithTimeout 的
+// 封顶语义漂移；修复后 300ms 重试醒来即封口返回 ErrLockTimeout。
+func TestLock_TimeoutIsStrictUpperBound(t *testing.T) {
+	mr := miniredis.RunT(t)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	ctx := context.Background()
+
+	// 他方持锁（默认不开自动续期），120ms 后释放——timeout=50ms 早已过期 70ms。
+	other := NewRedisLocker(c)
+	ownerID, err := other.TryLock(ctx, "strict-deadline", time.Second)
+	if err != nil {
+		t.Fatalf("seed trylock: %v", err)
+	}
+	release := time.AfterFunc(120*time.Millisecond, func() {
+		_ = other.Unlock(ctx, "strict-deadline", ownerID)
+	})
+	defer release.Stop()
+
+	l := NewRedisLocker(c, WithRetryInterval(300*time.Millisecond))
+	start := time.Now()
+	got, err := l.Lock(ctx, "strict-deadline", time.Second, 50*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("Lock(timeout=50ms) with late release at 120ms = (%q, %v), want ErrLockTimeout (redisx#178: 超时后不得成功)", got, err)
+	}
+	if got != "" {
+		t.Fatalf("timeout path must return empty ownerID, got %q", got)
+	}
+	// 醒来封口发生在首个重试间隔（300ms）后：既不是超时前抢先成功，也不是
+	// 越界后的成功路径。
+	if elapsed < 250*time.Millisecond {
+		t.Fatalf("Lock returned at %v, want >= one retry interval (~300ms)", elapsed)
+	}
+}
+
+// TestLock_TimeoutStillAllowsFirstAttempt 钉住 #178 裁决的对齐面：timeout=0
+// 仍保留一次非阻塞尝试——锁空闲时 Lock(timeout=0) 成功，与 etcdx 侧注释
+// 声明的对齐口径一致；锁被占且 deadline 已过则首轮失败后立即 ErrLockTimeout。
+func TestLock_TimeoutStillAllowsFirstAttempt(t *testing.T) {
+	mr := miniredis.RunT(t)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	ctx := context.Background()
+
+	l := NewRedisLocker(c)
+	ownerID, err := l.Lock(ctx, "zero-timeout-free", time.Minute, 0)
+	if err != nil {
+		t.Fatalf("Lock(timeout=0) on free lock must make one attempt and succeed, got %v", err)
+	}
+	if ownerID == "" {
+		t.Fatal("expected non-empty ownerID")
+	}
+
+	// 锁被占：timeout=0 首轮失败即超时返回，不等待重试间隔。
+	other := NewRedisLocker(c)
+	held, err := other.TryLock(ctx, "zero-timeout-held", time.Minute)
+	if err != nil {
+		t.Fatalf("held trylock: %v", err)
+	}
+	start := time.Now()
+	if _, err := l.Lock(ctx, "zero-timeout-held", time.Minute, 0); !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("Lock(timeout=0) on held lock = %v, want ErrLockTimeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("timeout=0 must fail fast after the single attempt, took %v", elapsed)
+	}
+	_ = held
+}

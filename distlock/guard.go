@@ -127,10 +127,13 @@ func (g *BruteForceGuard) memFor() *concrl.Lockout {
 // Fail 记一次失败事件，返回本次失败后的锁定态（locked=true 表示 key 已进入
 // 拒绝态；余量时长经 Check 查询，供对外 429 文案）。
 //
-// 分布式路径：窗口计数达阈值即锁定（惩罚时长只按首次触发计算，与 Lockout
-// 语义一致）。MemFallback 打开时 Redis 故障自动降级到进程内实现（本次失败
-// 记在进程内窗口，单实例有界）；关闭时故障原样上抛。调用方 ctx 取消/超时
-// 不是 Redis 故障，不降级、原样上抛。
+// 分布式路径：锁定态以脚本侧锁定标记（Lua `SET ... PX penalty` 的存在性，
+// redisx#171）为唯一口径，与 [BruteForceGuard.Check] 同源——不用「本次窗口
+// 计数 >= 阈值」复刻判定（LockTTL > Window 时窗口滑动后旧失败出窗，活跃
+// 锁定内会误报「未锁定」，按包文档 `if locked, _ := guard.Fail(...)` 门控的
+// 调用方将放过拒绝态请求）。MemFallback 打开时 Redis 故障自动降级到进程内
+// 实现（本次失败记在进程内窗口，单实例有界）；关闭时故障原样上抛。调用方
+// ctx 取消/超时不是 Redis 故障，不降级、原样上抛。
 func (g *BruteForceGuard) Fail(ctx context.Context, key string) (bool, error) {
 	if key == "" {
 		return false, fmt.Errorf("distlock: lockout key must not be empty")
@@ -138,16 +141,16 @@ func (g *BruteForceGuard) Fail(ctx context.Context, key string) (bool, error) {
 	if err := g.validate(); err != nil {
 		return false, err
 	}
-	n, err := g.dist.Fail(ctx, key)
+	_, locked, err := g.dist.failState(ctx, key)
 	if err == nil {
-		// 分布式脚本在 count >= threshold 时原子置位锁定标记 ⇒ 计数达阈值
-		// 等价于「现在处于锁定态」（含重复违规者的重新锁定）。
-		return n >= int64(g.cfg.MaxFails), nil
+		// redisx#171：脚本在置位锁定标记的同一原子执行里回传其存在性，
+		// 阈值触发与窗口滑动后的活跃锁定统一由标记说话。
+		return locked, nil
 	}
 	if isCtxErr(err) || !g.cfg.MemFallback {
 		return false, err
 	}
-	locked, _ := g.memFor().RecordFailure(key)
+	locked, _ = g.memFor().RecordFailure(key)
 	return locked, nil
 }
 

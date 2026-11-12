@@ -354,3 +354,36 @@ func TestResilientLimiter_FactoryNilNotCached(t *testing.T) {
 		t.Fatalf("next fallback = %+v, want {false SourceLocalFallback}", d)
 	}
 }
+
+// TestNewResilientLimiter_RejectsRescuedDist 构造期拦截（redisx#173）：dist
+// 配了 WithRescue（rescue != RescueOff）时故障降级在 PeriodLimit.Take 内部
+// 先行完成（恒返回非 Unknown），本类型的 FailModeClosed fail-closed 语义被
+// 静默旁路、Decision.Source 恒报 SourceRedis（观测失真）。叠配属编程错误，
+// 构造期 panic，不静默。
+func TestNewResilientLimiter_RejectsRescuedDist(t *testing.T) {
+	store, _ := newTestStore(t)
+	for _, m := range []RescueMode{RescueFailOpen, RescueBoundedLocal} {
+		dist := NewPeriodLimit(time.Minute, 10, store, "rl-guard", WithRescue(m))
+		if dist.Rescue() != m {
+			t.Fatalf("Rescue() predicate = %v, want %v (redisx#173 read-only judge)", dist.Rescue(), m)
+		}
+		func() {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("dist with rescue=%v must be rejected at construction (redisx#173)", m)
+				}
+			}()
+			NewResilientLimiter(dist, nil)
+		}()
+	}
+
+	// 对照组：RescueOff（默认）正常构造，判定路径不受影响。
+	l := NewResilientLimiter(NewPeriodLimit(time.Minute, 10, store, "rl-ok"), nil)
+	d, err := l.Allow(context.Background(), "k")
+	if err != nil {
+		t.Fatalf("rescue-off dist allow: %v", err)
+	}
+	if !d.Allowed || d.Source != SourceRedis {
+		t.Fatalf("rescue-off dist decision = %+v, want allowed via redis", d)
+	}
+}

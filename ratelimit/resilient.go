@@ -2,6 +2,7 @@ package ratelimit
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -135,15 +136,31 @@ type ResilientLimiter struct {
 // NewResilientLimiter 创建组合限流器。
 //
 // dist 为 Redis 侧判定（必填；nil 属编程错误，直接 panic——静默 nil 会让
-// 每次判定都走降级路径，限流形同虚设且无报错）；local 为本地兜底桶工厂
-// （可 nil：故障时按 FailMode 直接放行/拒绝），**每 key 只调用一次**（#127：
-// 结果由库层按 key 缓存、跨请求共享同一桶实例——随用随建会让故障期间的
-// 每个请求都拿到全新满桶，限流静默失效）；工厂返回 nil 视同未提供该 key 的
-// 本地桶，nil 结果**不缓存**（下次降级会再调工厂，保持「按 key 动态提供/
-// 收回」的语义）；需要共享单桶时闭包忽略 key 参数即可。
+// 每次判定都走降级路径，限流形同虚设且无报错）。**dist 必须保持 RescueOff**
+// （构造期断言，redisx#173）：dist 配了 [WithRescue]（rescue != RescueOff）
+// 时故障降级在 PeriodLimit.Take 内部先行完成（恒返回非 Unknown），本类型的
+// FailMode——尤其 FailModeClosed 的 fail-closed 语义——被静默旁路，
+// Decision.Source 恒报 SourceRedis（#118 建立的「故障 vs 限流」观测面失真），
+// dist 内部还会拉起本类型文档声明「无」的探活后台 goroutine；叠配属编程
+// 错误，构造期响亮拒绝（与 nil dist 同一口径）。故障降级口径由本类型单源：
+// 要弹性外壳就别给 dist 配 rescue，反之亦然。
+//
+// local 为本地兜底桶工厂（可 nil：故障时按 FailMode 直接放行/拒绝），
+// **每 key 只调用一次**（#127：结果由库层按 key 缓存、跨请求共享同一桶
+// 实例——随用随建会让故障期间的每个请求都拿到全新满桶，限流静默失效）；
+// 工厂返回 nil 视同未提供该 key 的本地桶，nil 结果**不缓存**（下次降级会
+// 再调工厂，保持「按 key 动态提供/收回」的语义）；需要共享单桶时闭包忽略
+// key 参数即可。
 func NewResilientLimiter(dist *PeriodLimit, local func(key string) LocalLimiter, opts ...ResilientOption) *ResilientLimiter {
 	if dist == nil {
 		panic("ratelimit: dist must not be nil")
+	}
+	// redisx#173：rescue != RescueOff 的 dist 与本类型叠配时，故障降级在
+	// dist 内部先行完成（Take 恒返回非 Unknown），本类型的 FailMode（尤其
+	// FailModeClosed 的 fail-closed 语义）被静默旁路，Decision.Source 恒报
+	// SourceRedis（观测失真）。构造期拦截，不静默。
+	if m := dist.Rescue(); m != RescueOff {
+		panic(fmt.Sprintf("ratelimit: dist must be built with RescueOff (got rescue mode %d): WithRescue degrades inside PeriodLimit.Take and silently bypasses ResilientLimiter's FailMode while Decision.Source misreports redis (redisx#173)", int(m)))
 	}
 	l := &ResilientLimiter{
 		dist:     dist,
