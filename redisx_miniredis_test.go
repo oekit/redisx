@@ -204,11 +204,11 @@ func TestListAndSetOps(t *testing.T) {
 	}
 }
 
-func TestBatch_OtherOps(t *testing.T) {
+func TestPipeline_OtherOps(t *testing.T) {
 	c, _ := newTestClient(t, "x:")
 	ctx := context.Background()
 
-	b := c.NewBatch()
+	b := c.Pipeline()
 	b.Set(ctx, "k1", "v1", 0)
 	b.Del(ctx, "k1", "missing")
 	b.HSet(ctx, "h", "f1", "v1")
@@ -373,11 +373,11 @@ func TestLua_Eval(t *testing.T) {
 	}
 }
 
-func TestBatch_Exec(t *testing.T) {
+func TestPipeline_Exec(t *testing.T) {
 	c, _ := newTestClient(t, "x:")
 	ctx := context.Background()
 
-	b := c.NewBatch()
+	b := c.Pipeline()
 	b.Set(ctx, "k1", "v1", 0)
 	b.Set(ctx, "k2", "v2", 0)
 	b.Incr(ctx, "counter")
@@ -436,16 +436,6 @@ func TestPipeline_Discard_AfterExec_SafeNoOp(t *testing.T) {
 		t.Fatalf("previously executed command's effect must persist: %v", err)
 	}
 
-	// Batch 委托同一 [Pipeline]，同口径。
-	b := c.NewBatch()
-	b.Set(ctx, "discard:no-op-2", "v", time.Minute)
-	if _, err := b.Exec(ctx); err != nil {
-		t.Fatalf("batch exec: %v", err)
-	}
-	b.Discard()
-	if b.Len() != 0 {
-		t.Fatalf("batch queue must stay empty after post-Exec Discard, len=%d", b.Len())
-	}
 }
 
 func TestCounter_HighLevel(t *testing.T) {
