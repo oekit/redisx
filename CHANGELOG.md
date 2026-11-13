@@ -1,3 +1,7 @@
+## [v0.16.0] — 2026-11-13
+
+- **BREAKING**：删除 Batch/NewBatch 旧类型（redisx#161 终局）——Batch 是 Pipeline 的功能子集旧类型（12 方法全为单行委托），前缀管道抽象收敛为 Pipeline/TxPipeline 单套。下游迁移：client.NewBatch() → client.Pipeline()（方法同构）。地板随迁 pkg v0.48.0 / logx v0.11.0 / concurrency v0.36.0。
+
 ## [v0.15.0] — 2026-11-12
 
 - refactor(distlock)!: **消费 pkg v0.45.0 distlock 契约单源**（etcdx#123 治本 redisx 侧）——`Locker` 接口改为 `pkg/distlock.Locker` 的**类型别名**（`type Locker = distlockpkg.Locker`，方法集与历史逐字相同、同进程同一 interface 类型，redisx/etcdx 跨后端互换不再靠注释手工对账）；三个哨兵 `ErrLockNotAcquired`/`ErrLockTimeout`/`ErrLockNotHeld` 改为 pkg 侧同值变量的**包级别名**（`var ErrLockTimeout = pkgdistlock.ErrLockTimeout` 形态，文案不变，下游 `distlock.ErrX` 与 `pkgdistlock.ErrX` 任一写法 errors.Is 都命中——同进程只此一套哨兵值）；`WithLock` 删本地实现改**薄转发** `pkg/distlock.WithLock`（签名、错误包装 `lock <key>: %w`、fn 结果不被释放失败覆盖均不变，调用方零改动；释放纪律 `context.WithoutCancel` 单源上提）。⚠️ BREAKING：**无签名级破坏**；行为兼容性影响——WithLock 释放失败的告警改由 pkg 侧记 log/slog（component=distlock），不再路由 Locker 实现的 per-instance logx logger，`WithLogger` 注入面收窄为本包自身告警（watchdog 续期失败/锁丢失/超最大生命周期，落点不变）。redisx 历史上不存在 etcdx 侧的 sentinel.Is/IsOneOf 补丁机制（哨兵本就同文案），本版主要消除的是「接口/哨兵/WithLock 三处各持一份拷贝」的单源缺口
