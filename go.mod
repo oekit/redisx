@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.40.0
-	github.com/oekit/concurrency v0.34.1
+	github.com/oekit/concurrency v0.35.0
 	github.com/oekit/logx v0.10.0
 	github.com/oekit/pkg v0.47.1
 	github.com/redis/go-redis/v9 v9.23.0
