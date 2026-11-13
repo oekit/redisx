@@ -22,12 +22,12 @@ func skipIfNoRedis(t *testing.T) *Client {
 	return client
 }
 
-func TestBatch_SetGet(t *testing.T) {
+func TestPipeline_SetGet(t *testing.T) {
 	client := skipIfNoRedis(t)
 	defer client.Close(context.Background())
 
 	ctx := context.Background()
-	batch := client.NewBatch()
+	batch := client.Pipeline()
 
 	// 批量 Set
 	batch.Set(ctx, "batch:test1", "value1", time.Minute)
@@ -59,11 +59,11 @@ func TestBatch_SetGet(t *testing.T) {
 	client.Del(ctx, "batch:test1", "batch:test2", "batch:test3")
 }
 
-func TestBatch_Len(t *testing.T) {
+func TestPipeline_Len(t *testing.T) {
 	client := skipIfNoRedis(t)
 	defer client.Close(context.Background())
 
-	batch := client.NewBatch()
+	batch := client.Pipeline()
 	if batch.Len() != 0 {
 		t.Errorf("expected len 0, got %d", batch.Len())
 	}
