@@ -1,3 +1,9 @@
+## [v0.16.2] — 2026-11-15
+
+- fix: BruteForceGuard 补幂等 Close(ctx)（未触发降级 no-op、已构建关清扫 goroutine，Close 后 Fail/Check/Reset 返回 ErrGuardClosed 不再懒构建，#221）；Fail 增 FailWithResult 返回 FailResult{Count,Locked,NewlyLocked,Remain} 携带「本次刚触发」跃迁（Lua SET NX/PTTL 精确判定，16 并发恰好 1 个 NewlyLocked），旧 Fail 委托新方法签名行为不变（#222）
+
+关联问题单：redisx#221、redisx#222。
+
 ## [v0.16.1] — 2026-11-15
 
 - 坏条目归一为 miss 回源自愈（#213）：反序列化失败/空字节不再硬报错，MGet 单键损坏不整批失败，GetOrLoad 可自愈
