@@ -172,6 +172,7 @@
 //	    LockTTL:     15 * time.Minute,
 //	    MemFallback: true, // Redis 故障降级到进程内 Lockout（单实例有界）
 //	})
+//	defer guard.Close(ctx) // 释放惰性构建的降级层后台清扫 goroutine（#221）
 //	if locked, _ := guard.Check(ctx, "user:42"); locked {
 //	    return ErrTooManyAttempts // 429，余量经 guard.Check 查询
 //	}
