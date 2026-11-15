@@ -2,6 +2,7 @@ package redisx
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -35,8 +36,68 @@ func (p *Pipeline) Raw() redis.Pipeliner {
 }
 
 // Exec 执行管道中排队的全部命令，返回各命令的结果。
+//
+// 错误口径（redisx#214）：返回的 error 是 go-redis 的**首条命令错误**
+// （cmdsFirstErr，command.go:263）——多条命令部分失败时只有排在最前的那条
+// 进 err，其余错误只在返回的 []redis.Cmder 上逐条可查；首条恰为 redis.Nil
+// （Get 未命中）时还会遮蔽其后的真实错误。因此 `err == nil` **不代表整批
+// 成功**，必须逐条检查 Cmder.Err()。需要「整批成功」的可直接判出口用
+// ExecChecked。
 func (p *Pipeline) Exec(ctx context.Context) ([]redis.Cmder, error) {
 	return p.pipe.Exec(ctx)
+}
+
+// ExecChecked 执行管道中排队的全部命令，返回**整批**聚合错误：
+// `err == nil` 当且仅当没有任何命令失败，调用方无需再逐条检查 Cmder。
+//
+// 与 Exec 的分工（redisx#214）：Exec 透传 go-redis 的首条错误口径，按
+// `err != nil` 判定会静默吞掉后续命令的失败；ExecChecked 聚合每条命令的
+// 错误：
+//   - 聚合全部非 nil 错误（errors.Join），errors.Is/As 可逐条判定；
+//   - redis.Nil 不计入：go-redis 明确「Nil 回复是成功的空值命令」
+//     （redis.go:1664），Get/LPop 未命中是合法负回复而非失败——计入会让
+//     含读命令的管道恒返回非 nil，出口形同虚设。需要判定「键不存在」请
+//     读排队期拿到的 Cmder（Err()/Result() 即 redis.Nil）；
+//   - 同一错误铺到多条命令时（传输级失败：连接被拒/超时，go-redis
+//     setCmdsErr 全量填充）按等价去重，报错消息不重复 N 遍。
+//
+// 只返回 error：各命令的结果从排队期方法返回的 Cmder 读取（与 Exec 返回
+// 的 []Cmder 是同一批对象）。
+func (p *Pipeline) ExecChecked(ctx context.Context) error {
+	cmds, execErr := p.pipe.Exec(ctx)
+	errs := make([]error, 0, len(cmds))
+	for _, cmd := range cmds {
+		err := cmd.Err()
+		if err == nil || errors.Is(err, redis.Nil) {
+			continue // 成功；redis.Nil 是合法负回复（见 godoc）
+		}
+		if containsErr(errs, err) {
+			continue // 等价错误已收录（传输级失败全量铺开/同类同值）
+		}
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	// 逐条皆成功或仅 redis.Nil：execErr 理论上也只可能是 redis.Nil
+	// （go-redis cmdsFirstErr 从 cmds 派生）；非 Nil 时兜底上抛不吞错。
+	if execErr != nil && !errors.Is(execErr, redis.Nil) {
+		return execErr
+	}
+	return nil
+}
+
+// containsErr 判断 err 是否与 errs 中已收录的某条**等价**（双向 errors.Is，
+// 单向会把「包装了已有错误的新错误」误判为重复而丢掉其上下文）。等价场景：
+// 传输级失败同一实例铺到每条命令、服务端同类错误同值（proto.Error 为字符串
+// 类型）。
+func containsErr(errs []error, err error) bool {
+	for _, e := range errs {
+		if errors.Is(err, e) && errors.Is(e, err) {
+			return true
+		}
+	}
+	return false
 }
 
 // Discard 丢弃管道中尚未执行的命令。
