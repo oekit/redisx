@@ -444,6 +444,69 @@ func TestRedisCache_Refresh(t *testing.T) {
 	}
 }
 
+// TestRedisCache_Refresh_NoSourceFailFast 回归（redisx#215 删除顺序）：
+// 未配置 Source 时 Refresh 必须在**Del 之前** fail-fast 返回 error——旧实现
+// 先删缓存再走 GetOrLoad（Source==nil 返回 (nil,nil)），调用方拿到「刷新完成、
+// 值为 nil」而缓存已被清空且永不回源（静默数据丢失）。钉住两件事：
+// ① 返回 error 而非 (nil, nil)；② 已有条目原样保留（Del 未执行）。
+func TestRedisCache_Refresh_NoSourceFailFast(t *testing.T) {
+	client, _ := newTestRedisClient(t)
+	// 纯缓存用法：只配 Prefix/TTL，不配 Source（Set/Get 完全合法）
+	c := NewRedisCache[testUser](client, RedisConfig[testUser]{
+		Prefix: "x:",
+		TTL:    time.Minute,
+	})
+	ctx := context.Background()
+
+	if err := c.Set(ctx, "k", &testUser{ID: 1, Name: "v1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.Refresh(ctx, "k")
+	if err == nil {
+		t.Fatal("未配置 Source 的 Refresh 必须返回 error（fail-fast），不得返回 (nil, nil)")
+	}
+	if got != nil {
+		t.Errorf("失败路径不应返回值，got %+v", got)
+	}
+	// 对照：条目必须还在——修复前此处已被 Del 清空
+	v, gerr := c.Get(ctx, "k")
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if v == nil || v.ID != 1 {
+		t.Errorf("fail-fast 不得先删缓存（#215 删除顺序），条目应原样保留，got %+v", v)
+	}
+}
+
+// TestRedisCache_Refresh_DelErrorPropagates 回归（redisx#215）：Del 失败必须
+// 上抛而非只记日志——旧实现 log 后继续 GetOrLoad，读到旧值时旧值冒充刷新结果
+// 返回（错误面断裂）。钉住：返回 error、不返回旧值。
+func TestRedisCache_Refresh_DelErrorPropagates(t *testing.T) {
+	client, mr := newTestRedisClient(t)
+	c := NewRedisCache[testUser](client, RedisConfig[testUser]{
+		Prefix: "x:",
+		TTL:    time.Minute,
+		Source: func(ctx context.Context, key string) (*testUser, error) {
+			return &testUser{ID: 42, Name: "src"}, nil
+		},
+	})
+	ctx := context.Background()
+	if err := c.Set(ctx, "k", &testUser{ID: 1, Name: "old"}); err != nil {
+		t.Fatal(err)
+	}
+
+	mr.Close() // 服务端关闭 → Del 必失败
+
+	got, err := c.Refresh(ctx, "k")
+	if err == nil {
+		t.Fatal("Del 失败必须上抛（修复前只 log 后继续）")
+	}
+	if got != nil {
+		t.Errorf("Del 失败不得返回值（旧值冒充刷新结果），got %+v", got)
+	}
+}
+
 func TestRedisCache_FullKey(t *testing.T) {
 	client, _ := newTestRedisClient(t)
 	c := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "app:user:"})

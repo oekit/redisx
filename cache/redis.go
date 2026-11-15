@@ -368,10 +368,21 @@ func (c *RedisCache[T]) Exists(ctx context.Context, key string) (bool, error) {
 }
 
 // Refresh 刷新缓存（删除后重新从 Source 加载）。
-// 必须配置 Source 函数。
+//
+// 必须配置 Source 函数——未配置时**入口 fail-fast 返回 error**（redisx#215），
+// 在 Del 之前拦截：纯缓存用法（只配 Prefix/TTL，Set/Get 完全合法）按 godoc
+// 字面调 Refresh 时，旧实现先 Del 再走 GetOrLoad，而 GetOrLoad 在 Source==nil
+// 时返回 (nil, nil)——调用方拿到「刷新完成、值为 nil」，实际缓存已被清空且
+// 永不回源（把 nil 当「数据不存在」写回业务层即静默数据丢失）。
+//
+// Del 失败直接上抛（redisx#215），不再只记日志：删除失败后 GetOrLoad 读到
+// 的是旧值，旧值冒充刷新结果返回同样是错误面断裂；中止即中止，调用方可重试。
 func (c *RedisCache[T]) Refresh(ctx context.Context, key string) (*T, error) {
+	if c.cfg.Source == nil {
+		return nil, fmt.Errorf("cache Refresh: Source not configured")
+	}
 	if err := c.Del(ctx, key); err != nil {
-		c.log.Error("refresh del error", "key", key, logx.ErrKey, err)
+		return nil, fmt.Errorf("cache refresh del: %w", err)
 	}
 	return c.GetOrLoad(ctx, key)
 }
