@@ -98,6 +98,40 @@ func TestStringOps(t *testing.T) {
 	}
 }
 
+// TestSet_ZeroExpirationIsPermanent 回归（redisx#216 文档口径）：Client.Set
+// 的 expiration=0 直通 go-redis 语义——不下发 EX，写**永久键**（miniredis
+// TTL 为 0 即无过期）；正值才带 TTL。该口径已写入 Client.Set/Pipeline.Set
+// godoc 与包文档示例（示例改用正 TTL），测试钉住行为与文档一致——防止
+// 后续有人把 0「修」成 cache 包的 24h 缺省口径而不改文档。
+func TestSet_ZeroExpirationIsPermanent(t *testing.T) {
+	c, mr := newTestClient(t, "x:")
+	ctx := context.Background()
+
+	// 物理键经 convertKey 取（prefix "x:" 再拼一个冒号 → "x::perm"）；
+	// Exists 一并断言，避免「键不存在」与「永久键」都得到 TTL=0 的假通过。
+	if err := c.Set(ctx, "perm", "v", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	permKey := c.convertKey("perm")
+	if !mr.Exists(permKey) {
+		t.Fatalf("键 %q 应存在", permKey)
+	}
+	if ttl := mr.TTL(permKey); ttl != 0 {
+		t.Errorf("expiration=0 应写永久键（无 TTL），got TTL=%v", ttl)
+	}
+
+	if err := c.Set(ctx, "ttl", "v", time.Minute).Err(); err != nil {
+		t.Fatal(err)
+	}
+	ttlKey := c.convertKey("ttl")
+	if !mr.Exists(ttlKey) {
+		t.Fatalf("键 %q 应存在", ttlKey)
+	}
+	if ttl := mr.TTL(ttlKey); ttl != time.Minute {
+		t.Errorf("expiration>0 应带 TTL，got TTL=%v", ttl)
+	}
+}
+
 func TestCounterOps(t *testing.T) {
 	c, _ := newTestClient(t, "x:")
 	ctx := context.Background()

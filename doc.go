@@ -36,8 +36,11 @@
 //
 // 所有操作的 key 会自动添加 "prefix:" 前缀：
 //
-//	client.Set(ctx, "user:123", value, 0)
+//	client.Set(ctx, "user:123", value, 24*time.Hour)
 //	// 实际存储的 key 为 "myservice:user:123"
+//
+// 注意 Set 的 expiration=0 是**永久键**（不下发过期参数，见 Client.Set），
+// 需要过期请传正值——上面用正 TTL 就是这个原因。
 //
 // # 原生客户端
 //

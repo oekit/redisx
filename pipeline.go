@@ -125,6 +125,9 @@ func (p *Pipeline) Get(ctx context.Context, key string) *redis.StringCmd {
 }
 
 // Set 设置 key 的值。
+//
+// expiration 语义与 Client.Set 直通一致（redisx#216）：0 = 永久键（不下发
+// 过期参数），需要过期请传正值；-1 = redis.KeepTTL。
 func (p *Pipeline) Set(ctx context.Context, key string, value any, expiration time.Duration) *redis.StatusCmd {
 	return p.pipe.Set(ctx, p.client.convertKey(key), value, expiration)
 }

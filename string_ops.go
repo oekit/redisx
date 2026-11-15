@@ -17,6 +17,17 @@ func (c *Client) Get(ctx context.Context, key string) *redis.StringCmd {
 }
 
 // Set 设置 key 的值。
+//
+// expiration 直通 go-redis 语义（redisx#216，此前零文档）：
+//   - > 0：下发 EX/PX，键带过期时间；
+//   - 0：**不下发过期参数 ⇒ 永久键（永不过期）**——漏传 TTL 变量的零值
+//     会静默落成永久键，需要过期请显式传正值；
+//   - -1（redis.KeepTTL）：KEEPTTL，覆盖值时保留原 TTL（新键则不设 TTL）；
+//   - 其他负值：同 0（不下发过期参数，永久键）。
+//
+// 与 cache 包的口径不同（迁移时勿按那边的经验推断）：cache.RedisCache.Set
+// 对 0 取 24h 缺省、SetWithTTL 对 <=0 直接报错（redisx#113）；本方法是
+// go-redis 的直通封装，不做任何缺省改写。
 func (c *Client) Set(ctx context.Context, key string, value any, expiration time.Duration) *redis.StatusCmd {
 	return c.client.Set(ctx, c.convertKey(key), value, expiration)
 }
