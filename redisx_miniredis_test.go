@@ -2,7 +2,9 @@ package redisx
 
 import (
 	"context"
+	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,6 +97,40 @@ func TestStringOps(t *testing.T) {
 	ok, _ = c.Expire(ctx, "ttl-key", time.Minute).Result()
 	if !ok {
 		t.Error("Expire on existing key should return true")
+	}
+}
+
+// TestSet_ZeroExpirationIsPermanent 回归（redisx#216 文档口径）：Client.Set
+// 的 expiration=0 直通 go-redis 语义——不下发 EX，写**永久键**（miniredis
+// TTL 为 0 即无过期）；正值才带 TTL。该口径已写入 Client.Set/Pipeline.Set
+// godoc 与包文档示例（示例改用正 TTL），测试钉住行为与文档一致——防止
+// 后续有人把 0「修」成 cache 包的 24h 缺省口径而不改文档。
+func TestSet_ZeroExpirationIsPermanent(t *testing.T) {
+	c, mr := newTestClient(t, "x:")
+	ctx := context.Background()
+
+	// 物理键经 convertKey 取（prefix "x:" 再拼一个冒号 → "x::perm"）；
+	// Exists 一并断言，避免「键不存在」与「永久键」都得到 TTL=0 的假通过。
+	if err := c.Set(ctx, "perm", "v", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	permKey := c.convertKey("perm")
+	if !mr.Exists(permKey) {
+		t.Fatalf("键 %q 应存在", permKey)
+	}
+	if ttl := mr.TTL(permKey); ttl != 0 {
+		t.Errorf("expiration=0 应写永久键（无 TTL），got TTL=%v", ttl)
+	}
+
+	if err := c.Set(ctx, "ttl", "v", time.Minute).Err(); err != nil {
+		t.Fatal(err)
+	}
+	ttlKey := c.convertKey("ttl")
+	if !mr.Exists(ttlKey) {
+		t.Fatalf("键 %q 应存在", ttlKey)
+	}
+	if ttl := mr.TTL(ttlKey); ttl != time.Minute {
+		t.Errorf("expiration>0 应带 TTL，got TTL=%v", ttl)
 	}
 }
 
@@ -517,10 +553,85 @@ func TestCounter_Get_NonExistent(t *testing.T) {
 }
 
 func TestNewClientFromConfig(t *testing.T) {
-	// NewClientFromConfig 需要从 nacos 拉配置, 这里只测 error 路径
+	// 空配置：Host 为空构造期 fail-fast（#217），不再拨 ":6379" 碰运气
 	_, err := NewClientFromConfig(context.Background(), RedisConfig{})
 	if err == nil {
-		t.Error("expected error for empty config (no Nacos available)")
+		t.Error("expected error for empty config")
+	}
+	if !strings.Contains(err.Error(), "redis.host") {
+		t.Errorf("错误应点名配置键 redis.host（#217），got %v", err)
+	}
+}
+
+// TestNewClientFromConfig_ValidatesHostPort 回归（redisx#217）：漏配
+// redis.host 时旧实现拼出 ":6379"——Go dial 解析为本机回环，本地有 Redis
+// 即 Ping 通过、数据写进错误实例且零日志；Port 越界同理停在晦涩的 dial
+// 错误。钉住：两者都在构造期 fail-fast 且点名配置键，不发起拨号。
+func TestNewClientFromConfig_ValidatesHostPort(t *testing.T) {
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		cfg  RedisConfig
+		want string
+	}{
+		{"host 为空", RedisConfig{Port: 6379}, "redis.host"},
+		{"port 0（YAML 漏配）", RedisConfig{Host: "127.0.0.1"}, "redis.port"},
+		{"port 超上界", RedisConfig{Host: "127.0.0.1", Port: 65536}, "redis.port"},
+		{"port 负值", RedisConfig{Host: "127.0.0.1", Port: -1}, "redis.port"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewClientFromConfig(ctx, tc.cfg)
+			if err == nil {
+				t.Fatal("非法配置必须构造期报错")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("错误应点名 %s，got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// TestNewClientFromConfig_OK 校验通过路径仍连通（miniredis）：验证只拦
+// 非法配置，不误伤正常 host:port（含从 mr.Addr() 拆出的随机端口）。
+func TestNewClientFromConfig_OK(t *testing.T) {
+	mr := miniredis.RunT(t)
+	host, portStr, err := net.SplitHostPort(mr.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewClientFromConfig(context.Background(), RedisConfig{Host: host, Port: port})
+	if err != nil {
+		t.Fatalf("合法配置不应报错，got %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+	if err := c.Ping(context.Background()).Err(); err != nil {
+		t.Errorf("Ping 应通过，got %v", err)
+	}
+}
+
+// TestNewClientFromConfig_IPv6JoinHostPort 回归（redisx#217 附带）：Host 为
+// IPv6 字面量时 net.JoinHostPort 括号化——"%s:%d" 会拼出 "::1:6379" 非法
+// 地址，错误停在 dial 期且不点名 host。这里只验地址形态（不真拨号），
+// 通过拆解校验后的结果无法直接拿到，故用同口径拼接断言。
+func TestNewClientFromConfig_IPv6JoinHostPort(t *testing.T) {
+	got := net.JoinHostPort("::1", strconv.Itoa(6379))
+	if got != "[::1]:6379" {
+		t.Errorf("IPv6 地址应括号化，got %q", got)
+	}
+	// 真实构造路径：IPv6 host 校验通过后进入拨号，miniredis 不监听 ::1，
+	// 断言错误来自拨号而非校验（即校验没把合法 IPv6 拦掉）。
+	_, err := NewClientFromConfig(context.Background(), RedisConfig{Host: "::1", Port: 1})
+	if err == nil {
+		t.Fatal("未监听的地址应报错")
+	}
+	if strings.Contains(err.Error(), "redis.host") || strings.Contains(err.Error(), "redis.port") {
+		t.Errorf("合法 IPv6 host/port 不应触发校验错误，got %v", err)
 	}
 }
 
@@ -544,9 +655,6 @@ func TestNewClient_InvalidAddr(t *testing.T) {
 		t.Error("expected ping to fail for unreachable address")
 	}
 }
-
-// 工具: str to int (避免引入 strconv 当只是用一次)
-var _ = strconv.Itoa
 
 // TestCounter_LuaKeysUsePrefix 回归：DecrFloor/IncrWithTTL 的 Lua 脚本走
 // 裸 client，key 曾漏过 convertKey —— 与 Get/Incr 等前缀感知路径操作不同

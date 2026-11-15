@@ -82,17 +82,72 @@ func TestRedisCache_Get_NullValueMarker(t *testing.T) {
 	}
 }
 
-func TestRedisCache_Get_DeserializeError(t *testing.T) {
+// TestRedisCache_CorruptEntry_TreatedAsMiss 回归（#213）：非空但不可
+// 反序列化的损坏条目必须与空字节同口径按 miss 处理——此前硬报错会让
+// GetOrLoad 短路返回、Source 永不被调用，坏条目存活到 TTL（缺省 24h）
+// 期间所有读取全部失败且无自愈路径。
+func TestRedisCache_CorruptEntry_TreatedAsMiss(t *testing.T) {
 	client, mr := newTestRedisClient(t)
 	if err := mr.Set("x:bad", "not valid json"); err != nil {
 		t.Fatal(err)
 	}
-	c := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "x:"})
+	sourceCalls := 0
+	c := NewRedisCache[testUser](client, RedisConfig[testUser]{
+		Prefix: "x:",
+		TTL:    time.Minute,
+		Source: func(ctx context.Context, key string) (*testUser, error) {
+			sourceCalls++
+			return &testUser{ID: 9, Name: "healed"}, nil
+		},
+	})
 	ctx := context.Background()
 
-	_, err := c.Get(ctx, "bad")
-	if err == nil {
-		t.Error("expected deserialize error, got nil")
+	// 纯 Get：miss（非 error），与 key 不存在同口径
+	got, err := c.Get(ctx, "bad")
+	if err != nil {
+		t.Fatalf("损坏条目应按 miss 处理而非硬报错（#213），got err=%v", err)
+	}
+	if got != nil {
+		t.Fatalf("损坏条目 Get 应返回 nil, got %+v", got)
+	}
+
+	// GetOrLoad：回源 + 覆盖自愈（修复前 Source 永不被调用）
+	loaded, err := c.GetOrLoad(ctx, "bad")
+	if err != nil {
+		t.Fatalf("GetOrLoad: %v", err)
+	}
+	if sourceCalls != 1 {
+		t.Fatalf("损坏条目应回源自愈，Source 被调用 %d 次（修复前为 0）", sourceCalls)
+	}
+	if loaded == nil || loaded.Name != "healed" {
+		t.Fatalf("GetOrLoad 应返回 Source 值, got %+v", loaded)
+	}
+	// 自愈证明：坏条目已被回填的有效 JSON 覆盖，再次 Get 命中真值
+	got, err = c.Get(ctx, "bad")
+	if err != nil || got == nil || got.Name != "healed" {
+		t.Fatalf("回源覆盖后应命中有效值，got %+v err=%v", got, err)
+	}
+}
+
+// TestRedisCache_MGet_CorruptEntry_SkipsNotWholeBatchFail 回归（#213）：
+// MGet 遇到单个损坏条目不得整批硬失败——坏键缺席、其余命中键照常返回。
+func TestRedisCache_MGet_CorruptEntry_SkipsNotWholeBatchFail(t *testing.T) {
+	client, mr := newTestRedisClient(t)
+	c := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "x:", TTL: time.Minute})
+	if err := mr.Set("x:good", `{"ID":1,"Name":"alice"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := mr.Set("x:corrupt", "not valid json"); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	got, err := c.MGet(ctx, "good", "corrupt", "absent")
+	if err != nil {
+		t.Fatalf("MGet 不应因单个损坏条目整批报错（#213），got err=%v", err)
+	}
+	if len(got) != 1 || got["good"] == nil || got["good"].Name != "alice" {
+		t.Fatalf("MGet = %v, want 只含 good（corrupt/absent 缺席）", got)
 	}
 }
 
@@ -386,6 +441,69 @@ func TestRedisCache_Refresh(t *testing.T) {
 	}
 	if loadCount != 1 {
 		t.Errorf("expected 1 Source call after first refresh, got %d", loadCount)
+	}
+}
+
+// TestRedisCache_Refresh_NoSourceFailFast 回归（redisx#215 删除顺序）：
+// 未配置 Source 时 Refresh 必须在**Del 之前** fail-fast 返回 error——旧实现
+// 先删缓存再走 GetOrLoad（Source==nil 返回 (nil,nil)），调用方拿到「刷新完成、
+// 值为 nil」而缓存已被清空且永不回源（静默数据丢失）。钉住两件事：
+// ① 返回 error 而非 (nil, nil)；② 已有条目原样保留（Del 未执行）。
+func TestRedisCache_Refresh_NoSourceFailFast(t *testing.T) {
+	client, _ := newTestRedisClient(t)
+	// 纯缓存用法：只配 Prefix/TTL，不配 Source（Set/Get 完全合法）
+	c := NewRedisCache[testUser](client, RedisConfig[testUser]{
+		Prefix: "x:",
+		TTL:    time.Minute,
+	})
+	ctx := context.Background()
+
+	if err := c.Set(ctx, "k", &testUser{ID: 1, Name: "v1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.Refresh(ctx, "k")
+	if err == nil {
+		t.Fatal("未配置 Source 的 Refresh 必须返回 error（fail-fast），不得返回 (nil, nil)")
+	}
+	if got != nil {
+		t.Errorf("失败路径不应返回值，got %+v", got)
+	}
+	// 对照：条目必须还在——修复前此处已被 Del 清空
+	v, gerr := c.Get(ctx, "k")
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if v == nil || v.ID != 1 {
+		t.Errorf("fail-fast 不得先删缓存（#215 删除顺序），条目应原样保留，got %+v", v)
+	}
+}
+
+// TestRedisCache_Refresh_DelErrorPropagates 回归（redisx#215）：Del 失败必须
+// 上抛而非只记日志——旧实现 log 后继续 GetOrLoad，读到旧值时旧值冒充刷新结果
+// 返回（错误面断裂）。钉住：返回 error、不返回旧值。
+func TestRedisCache_Refresh_DelErrorPropagates(t *testing.T) {
+	client, mr := newTestRedisClient(t)
+	c := NewRedisCache[testUser](client, RedisConfig[testUser]{
+		Prefix: "x:",
+		TTL:    time.Minute,
+		Source: func(ctx context.Context, key string) (*testUser, error) {
+			return &testUser{ID: 42, Name: "src"}, nil
+		},
+	})
+	ctx := context.Background()
+	if err := c.Set(ctx, "k", &testUser{ID: 1, Name: "old"}); err != nil {
+		t.Fatal(err)
+	}
+
+	mr.Close() // 服务端关闭 → Del 必失败
+
+	got, err := c.Refresh(ctx, "k")
+	if err == nil {
+		t.Fatal("Del 失败必须上抛（修复前只 log 后继续）")
+	}
+	if got != nil {
+		t.Errorf("Del 失败不得返回值（旧值冒充刷新结果），got %+v", got)
 	}
 }
 
