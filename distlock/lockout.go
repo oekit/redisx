@@ -18,10 +18,13 @@ import (
 //   - count >= threshold 时 SET NX PX 置锁定标记——NX 保证**惩罚时长只按首次
 //     触发计算**，后续失败不延长（与 concurrency/ratelimit.Lockout 语义一致）；
 //     锁定标记过期后窗口内旧失败仍在，下一次 Fail 即重新锁定（重复违规者）；
-//   - 返回 {count, locked}（redisx#171）：locked = EXISTS KEYS[2]，锁定态的
-//     唯一判定口径是脚本侧锁定标记（SET PX penalty），不是「count >= 阈值」
-//     ——LockTTL > Window 时窗口滑动后旧失败出窗，计数跌破阈值而锁定标记
-//     PTTL 未到期，按计数复刻判定会在活跃锁定内误报「未锁定」。
+//     SET NX 的成功/失败即「本次是否触发 未锁→锁 跃迁」，与 EXISTS 分开回传
+//     （redisx#222：告警只需在跃迁那次发一次，并发跨阈值恰好一个 true）；
+//   - 返回 {count, locked, newly, ttl_ms}：count = 窗口基数；locked =
+//     EXISTS KEYS[2]（锁定态的唯一判定口径，#171——不是「count >= 阈值」，
+//     LockTTL > Window 时窗口滑动后旧失败出窗，计数跌破阈值而锁定标记 PTTL
+//     未到期，按计数复刻判定会在活跃锁定内误报「未锁定」）；newly = 本次
+//     SET NX 是否成功；ttl_ms = PTTL（未锁定/已到期为 0，省一次 Check）。
 var lockoutFailScript = redis.NewScript(`
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', tonumber(ARGV[1]) - tonumber(ARGV[2]))
 local seq = redis.call('INCR', KEYS[3])
@@ -29,11 +32,19 @@ redis.call('PEXPIRE', KEYS[3], tonumber(ARGV[2]))
 redis.call('ZADD', KEYS[1], ARGV[1], ARGV[1] .. ':' .. seq)
 redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]))
 local count = redis.call('ZCARD', KEYS[1])
+local newly = 0
 if count >= tonumber(ARGV[3]) then
-	redis.call('SET', KEYS[2], '1', 'PX', ARGV[4], 'NX')
+	local ok = redis.call('SET', KEYS[2], '1', 'PX', ARGV[4], 'NX')
+	if ok then
+		newly = 1
+	end
 end
 local locked = redis.call('EXISTS', KEYS[2])
-return {count, locked}
+local ttl = redis.call('PTTL', KEYS[2])
+if ttl < 0 then
+	ttl = 0
+end
+return {count, locked, newly, ttl}
 `)
 
 // lockoutCheckScript 锁定标记剩余毫秒数（>0 = 锁定中）。
@@ -148,30 +159,39 @@ func (l *Lockout) Fail(ctx context.Context, key string) (int64, error) {
 	if err := l.validate(); err != nil {
 		return 0, err
 	}
-	n, _, err := l.failState(ctx, key)
+	n, _, _, _, err := l.failState(ctx, key)
 	return n, err
 }
 
-// failState 执行 lockoutFailScript，返回窗口计数与锁定态（redisx#171）：
-// locked 以脚本侧锁定标记（EXISTS KEYS[2]）为准——BruteForceGuard.Fail 的
-// 返回值唯一口径，Go 侧不再按「count >= 阈值」复刻判定。
-func (l *Lockout) failState(ctx context.Context, key string) (int64, bool, error) {
+// failState 执行 lockoutFailScript，返回窗口计数、锁定态与本次跃迁信息
+// （redisx#171/#222）：
+//   - locked 以脚本侧锁定标记（EXISTS KEYS[2]）为准——BruteForceGuard.Fail
+//     的返回值唯一口径，Go 侧不再按「count >= 阈值」复刻判定；
+//   - newlyLocked = 本次 `SET NX` 是否成功（未锁→锁跃迁，并发跨阈值恰好
+//     一个 true）；
+//   - remain = 锁定标记 PTTL（未锁定/已到期为 0）。
+func (l *Lockout) failState(ctx context.Context, key string) (count int64, locked, newlyLocked bool, remain time.Duration, err error) {
 	res, err := lockoutFailScript.Run(ctx, l.client, l.keys(key),
 		l.now().UnixMilli(), ttlMillis(l.cfg.Window), l.cfg.Threshold,
 		ttlMillis(l.cfg.Penalty)).Result()
 	if err != nil {
-		return 0, false, fmt.Errorf("redis lockout fail failed: %w", err)
+		return 0, false, false, 0, fmt.Errorf("redis lockout fail failed: %w", err)
 	}
 	vals, ok := res.([]any)
-	if !ok || len(vals) != 2 {
-		return 0, false, fmt.Errorf("redis lockout fail: unexpected reply %v", res)
+	if !ok || len(vals) != 4 {
+		return 0, false, false, 0, fmt.Errorf("redis lockout fail: unexpected reply %v", res)
 	}
-	count, _ := vals[0].(int64)
-	locked := false
+	count, _ = vals[0].(int64)
 	if v, ok := vals[1].(int64); ok && v == 1 {
 		locked = true
 	}
-	return count, locked, nil
+	if v, ok := vals[2].(int64); ok && v == 1 {
+		newlyLocked = true
+	}
+	if v, ok := vals[3].(int64); ok && v > 0 {
+		remain = time.Duration(v) * time.Millisecond
+	}
+	return count, locked, newlyLocked, remain, nil
 }
 
 // Check 查询 key 是否处于锁定拒绝态：locked=true 时 remain 为剩余锁定时长
