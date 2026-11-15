@@ -82,17 +82,72 @@ func TestRedisCache_Get_NullValueMarker(t *testing.T) {
 	}
 }
 
-func TestRedisCache_Get_DeserializeError(t *testing.T) {
+// TestRedisCache_CorruptEntry_TreatedAsMiss 回归（#213）：非空但不可
+// 反序列化的损坏条目必须与空字节同口径按 miss 处理——此前硬报错会让
+// GetOrLoad 短路返回、Source 永不被调用，坏条目存活到 TTL（缺省 24h）
+// 期间所有读取全部失败且无自愈路径。
+func TestRedisCache_CorruptEntry_TreatedAsMiss(t *testing.T) {
 	client, mr := newTestRedisClient(t)
 	if err := mr.Set("x:bad", "not valid json"); err != nil {
 		t.Fatal(err)
 	}
-	c := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "x:"})
+	sourceCalls := 0
+	c := NewRedisCache[testUser](client, RedisConfig[testUser]{
+		Prefix: "x:",
+		TTL:    time.Minute,
+		Source: func(ctx context.Context, key string) (*testUser, error) {
+			sourceCalls++
+			return &testUser{ID: 9, Name: "healed"}, nil
+		},
+	})
 	ctx := context.Background()
 
-	_, err := c.Get(ctx, "bad")
-	if err == nil {
-		t.Error("expected deserialize error, got nil")
+	// 纯 Get：miss（非 error），与 key 不存在同口径
+	got, err := c.Get(ctx, "bad")
+	if err != nil {
+		t.Fatalf("损坏条目应按 miss 处理而非硬报错（#213），got err=%v", err)
+	}
+	if got != nil {
+		t.Fatalf("损坏条目 Get 应返回 nil, got %+v", got)
+	}
+
+	// GetOrLoad：回源 + 覆盖自愈（修复前 Source 永不被调用）
+	loaded, err := c.GetOrLoad(ctx, "bad")
+	if err != nil {
+		t.Fatalf("GetOrLoad: %v", err)
+	}
+	if sourceCalls != 1 {
+		t.Fatalf("损坏条目应回源自愈，Source 被调用 %d 次（修复前为 0）", sourceCalls)
+	}
+	if loaded == nil || loaded.Name != "healed" {
+		t.Fatalf("GetOrLoad 应返回 Source 值, got %+v", loaded)
+	}
+	// 自愈证明：坏条目已被回填的有效 JSON 覆盖，再次 Get 命中真值
+	got, err = c.Get(ctx, "bad")
+	if err != nil || got == nil || got.Name != "healed" {
+		t.Fatalf("回源覆盖后应命中有效值，got %+v err=%v", got, err)
+	}
+}
+
+// TestRedisCache_MGet_CorruptEntry_SkipsNotWholeBatchFail 回归（#213）：
+// MGet 遇到单个损坏条目不得整批硬失败——坏键缺席、其余命中键照常返回。
+func TestRedisCache_MGet_CorruptEntry_SkipsNotWholeBatchFail(t *testing.T) {
+	client, mr := newTestRedisClient(t)
+	c := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "x:", TTL: time.Minute})
+	if err := mr.Set("x:good", `{"ID":1,"Name":"alice"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := mr.Set("x:corrupt", "not valid json"); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	got, err := c.MGet(ctx, "good", "corrupt", "absent")
+	if err != nil {
+		t.Fatalf("MGet 不应因单个损坏条目整批报错（#213），got err=%v", err)
+	}
+	if len(got) != 1 || got["good"] == nil || got["good"].Name != "alice" {
+		t.Fatalf("MGet = %v, want 只含 good（corrupt/absent 缺席）", got)
 	}
 }
 

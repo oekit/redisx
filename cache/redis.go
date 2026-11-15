@@ -114,7 +114,9 @@ func (c *RedisCache[T]) Get(ctx context.Context, key string) (*T, error) {
 // getInternal 内部方法，返回 (值, 是否命中 null marker, error)。
 // 命中 null marker 时返回 (nil, true, nil)；
 // key 不存在返回 (nil, false, nil)；
-// 命中有效值返回 (&T, false, nil)。
+// 命中有效值返回 (&T, false, nil)；
+// 命中损坏条目（反序列化失败）同样返回 (nil, false, nil)——与空字节同口径
+// 按 miss 处理（#213），由 GetOrLoad 回源覆盖完成自愈。
 // 用于 GetOrLoad 区分"未命中"和"命中 null marker"，避免防穿透失效。
 func (c *RedisCache[T]) getInternal(ctx context.Context, key string) (*T, bool, error) {
 	fullKey := c.fullKey(key)
@@ -141,7 +143,15 @@ func (c *RedisCache[T]) getInternal(ctx context.Context, key string) (*T, bool, 
 
 	var result T
 	if err := c.cfg.Deserializer(data, &result); err != nil {
-		return nil, false, fmt.Errorf("cache deserialize: %w", err)
+		// 非空但不可反序列化的条目（SetRaw 写入非 JSON、部分写入、序列化
+		// 格式变更、他人绕过封装直写）同样按"条目损坏 → miss"处理（#213），
+		// 与上方空字节口径对齐：此前硬报错会让 GetOrLoad 短路返回、Source
+		// 永不被调用，坏条目存活到 TTL（缺省 24h）期间所有读取全部失败且
+		// 无自愈路径。归一为 miss 后 Source 回源覆盖即完成自愈；纯 Get 调用
+		// 方拿到与"key 不存在"一致的 miss 口径（GetBytes 仍原样返回原始
+		// 字节，需要区分损坏与否的走它）。仅告警不阻断。
+		c.log.Error("corrupt entry, treating as miss", "key", key, logx.ErrKey, err)
+		return nil, false, nil
 	}
 	return &result, false, nil
 }
@@ -300,7 +310,8 @@ func (c *RedisCache[T]) DelBatch(ctx context.Context, keys ...string) error {
 
 // MGet 批量获取（管道一次往返，契约见 pkg/cache.BatchGetter——缺席语义
 // 与 (nil, nil) 双关一致：不存在与 null marker 一律缺席；纯读不回填、
-// 不触发 Source）。反序列化失败按整批错误处理（与单键 Get 同口径）。
+// 不触发 Source）。损坏条目（反序列化失败）按 miss 缺席（#213，与
+// getInternal 单键口径一致），不整批报错。
 // 缺席键的消费方应回退 GetOrLoad——真 miss 回源回填，marker 命中在
 // 本实现的 GetOrLoad 内短路，两种情况都不会重复回源。
 func (c *RedisCache[T]) MGet(ctx context.Context, keys ...string) (map[string]*T, error) {
@@ -333,7 +344,10 @@ func (c *RedisCache[T]) MGet(ctx context.Context, keys ...string) (map[string]*T
 		}
 		var v T
 		if err := c.cfg.Deserializer([]byte(s), &v); err != nil {
-			return nil, fmt.Errorf("cache deserialize: %w", err)
+			// 损坏条目按 miss 缺席（#213）：单键 getInternal 已归一为 miss，
+			// 此处口径对齐——一条坏数据不再让整批硬失败（其余命中键照常返回）。
+			c.log.Error("corrupt entry, treating as miss", "key", keys[i], logx.ErrKey, err)
+			continue
 		}
 		out[keys[i]] = &v
 	}
