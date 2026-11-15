@@ -1,3 +1,13 @@
+## [v0.16.1] — 2026-11-15
+
+- 坏条目归一为 miss 回源自愈（#213）：反序列化失败/空字节不再硬报错，MGet 单键损坏不整批失败，GetOrLoad 可自愈
+- Pipeline 整批判定面（#214）：Exec godoc 明写 err 仅首条（cmdsFirstErr），新增 ExecChecked 用 errors.Join 聚合全部命令错误（redis.Nil 不计、传输级同错去重）
+- Refresh 无 Source 入口 fail-fast（#215）：删除前返回 error，不再先清缓存后永不回源；Del 错误上抛
+- Set expiration 语义成文（#216）：0=永久键不下发 EX、-1=KeepTTL、正值=TTL，与 cache 包口径差异点名
+- NewClientFromConfig 构造期校验地址（#217）：Host 非空、Port 1..65535，net.JoinHostPort 支持 IPv6，不再静默连本机回环
+
+关联问题单：redisx#213、redisx#214、redisx#215、redisx#216、redisx#217。
+
 ## [v0.16.0] — 2026-11-13
 
 - **BREAKING**：删除 Batch/NewBatch 旧类型（redisx#161 终局）——Batch 是 Pipeline 的功能子集旧类型（12 方法全为单行委托），前缀管道抽象收敛为 Pipeline/TxPipeline 单套。下游迁移：client.NewBatch() → client.Pipeline()（方法同构）。地板随迁 pkg v0.48.0 / logx v0.11.0 / concurrency v0.36.0。
