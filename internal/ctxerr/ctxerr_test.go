@@ -3,8 +3,9 @@ package ctxerr
 import (
 	"context"
 	"errors"
-	"fmt"
 	"testing"
+
+	pkgerrors "github.com/oekit/pkg/errors"
 )
 
 // TestIs_ctxErr 单源判定的分支钉（redisx#162）：取消/超时（含包装形态）
@@ -17,8 +18,8 @@ func TestIs_ctxErr(t *testing.T) {
 	}{
 		{"canceled", context.Canceled, true},
 		{"deadline exceeded", context.DeadlineExceeded, true},
-		{"wrapped canceled", fmt.Errorf("redis eval: %w", context.Canceled), true},
-		{"wrapped deadline", fmt.Errorf("dial: %w", context.DeadlineExceeded), true},
+		{"wrapped canceled", pkgerrors.Wrapf(context.Canceled, "redis eval"), true},
+		{"wrapped deadline", pkgerrors.Wrapf(context.DeadlineExceeded, "dial"), true},
 		{"redis error", errors.New("redis: connection refused"), false},
 		{"nil", nil, false},
 	}

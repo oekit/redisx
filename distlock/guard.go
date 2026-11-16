@@ -3,12 +3,12 @@ package distlock
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	concrl "github.com/oekit/concurrency/ratelimit"
+	pkgerrors "github.com/oekit/pkg/errors"
 
 	"github.com/oekit/redisx/internal/ctxerr"
 	"github.com/redis/go-redis/v9"
@@ -115,16 +115,16 @@ func NewBruteForceGuard(client redis.UniversalClient, cfg GuardConfig) *BruteFor
 // 双实现的语义参数同源校验）。
 func (g *BruteForceGuard) validate() error {
 	if g.client == nil {
-		return fmt.Errorf("distlock: brute force guard requires a non-nil redis client (set MemFallback for in-process degradation, nil client is still a config error)")
+		return pkgerrors.New("distlock: brute force guard requires a non-nil redis client (set MemFallback for in-process degradation, nil client is still a config error)")
 	}
 	if g.cfg.MaxFails < 1 {
-		return fmt.Errorf("distlock: brute force guard max fails must be positive, got %d", g.cfg.MaxFails)
+		return pkgerrors.Newf("distlock: brute force guard max fails must be positive, got %d", g.cfg.MaxFails)
 	}
 	if g.cfg.Window <= 0 {
-		return fmt.Errorf("distlock: brute force guard window must be positive, got %v", g.cfg.Window)
+		return pkgerrors.Newf("distlock: brute force guard window must be positive, got %v", g.cfg.Window)
 	}
 	if g.cfg.LockTTL <= 0 {
-		return fmt.Errorf("distlock: brute force guard lock ttl must be positive, got %v", g.cfg.LockTTL)
+		return pkgerrors.Newf("distlock: brute force guard lock ttl must be positive, got %v", g.cfg.LockTTL)
 	}
 	return nil
 }
@@ -199,7 +199,7 @@ func (g *BruteForceGuard) Fail(ctx context.Context, key string) (bool, error) {
 // 其余语义与 [BruteForceGuard.Fail] 一致（ctx 取消/超时不降级）。
 func (g *BruteForceGuard) FailWithResult(ctx context.Context, key string) (FailResult, error) {
 	if key == "" {
-		return FailResult{}, fmt.Errorf("distlock: lockout key must not be empty")
+		return FailResult{}, pkgerrors.New("distlock: lockout key must not be empty")
 	}
 	if g.closed.Load() {
 		return FailResult{}, ErrGuardClosed
@@ -233,7 +233,7 @@ func (g *BruteForceGuard) FailWithResult(ctx context.Context, key string) (FailR
 // 关闭时故障原样上抛。
 func (g *BruteForceGuard) Check(ctx context.Context, key string) (bool, time.Duration, error) {
 	if key == "" {
-		return false, 0, fmt.Errorf("distlock: lockout key must not be empty")
+		return false, 0, pkgerrors.New("distlock: lockout key must not be empty")
 	}
 	if g.closed.Load() {
 		return false, 0, ErrGuardClosed
@@ -265,7 +265,7 @@ func (g *BruteForceGuard) Check(ctx context.Context, key string) (bool, time.Dur
 // Reset（幂等）；关闭 MemFallback 时故障原样上抛，无此边界。
 func (g *BruteForceGuard) Reset(ctx context.Context, key string) error {
 	if key == "" {
-		return fmt.Errorf("distlock: lockout key must not be empty")
+		return pkgerrors.New("distlock: lockout key must not be empty")
 	}
 	if g.closed.Load() {
 		return ErrGuardClosed

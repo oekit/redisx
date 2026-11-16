@@ -5,12 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 
 	"github.com/oekit/logx"
 	pkgdistlock "github.com/oekit/pkg/distlock"
+	pkgerrors "github.com/oekit/pkg/errors"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -211,7 +211,7 @@ func (l *RedisLocker) lockKey(key string) string {
 func (l *RedisLocker) generateValue() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("crypto/rand.Read failed: %w", err)
+		return "", pkgerrors.Wrapf(err, "crypto/rand.Read failed")
 	}
 	return base64.StdEncoding.EncodeToString(b), nil
 }
@@ -232,12 +232,12 @@ func (l *RedisLocker) TryLock(ctx context.Context, key string, ttl time.Duration
 	// go-redis SetNX 的 ttl=0 表示永不过期——零值 Duration（未初始化的
 	// 常见笔误）会产生打不破的锁，持锁进程崩溃后所有实例永久阻塞。
 	if ttl <= 0 {
-		return "", fmt.Errorf("distlock: ttl must be positive, got %v", ttl)
+		return "", pkgerrors.Newf("distlock: ttl must be positive, got %v", ttl)
 	}
 	// 非法组合 fail-fast：nil client 且未开优雅降级时，缺构造校验会把
 	// 故障推迟到第一次加锁的运行时 nil interface panic。
 	if l.client == nil {
-		return "", fmt.Errorf("distlock: redis client is nil (construct with a client or enable WithGracefulDegradation)")
+		return "", pkgerrors.New("distlock: redis client is nil (construct with a client or enable WithGracefulDegradation)")
 	}
 
 	value, err := l.generateValue()
@@ -249,7 +249,7 @@ func (l *RedisLocker) TryLock(ctx context.Context, key string, ttl time.Duration
 		if l.onLock != nil {
 			l.onLock(key, false, err)
 		}
-		return "", fmt.Errorf("redis SetNX failed: %w", err)
+		return "", pkgerrors.Wrapf(err, "redis SetNX failed")
 	}
 	if !acquired {
 		if l.onLock != nil {
@@ -297,14 +297,14 @@ func (l *RedisLocker) Unlock(ctx context.Context, key string, ownerID string) er
 	// unlockScript.Run 在 nil interface 上调用 ⇒ 运行时 nil 指针 panic
 	// （TryLock/Renew 都有对称检查，Unlock 此前漏了）。
 	if l.client == nil {
-		return fmt.Errorf("distlock: redis client is nil (construct with a client or enable WithGracefulDegradation)")
+		return pkgerrors.New("distlock: redis client is nil (construct with a client or enable WithGracefulDegradation)")
 	}
 
 	// 删锁先行（#115）：拿到脚本结果前不碰 watchdog 状态。
 	result, err := unlockScript.Run(ctx, l.client, []string{l.lockKey(key)}, ownerID).Int()
 	if err != nil {
 		// 通信故障：锁可能仍在，watchdog 不停（继续续期兜底），状态原样保留。
-		werr := fmt.Errorf("redis unlock failed: %w", err)
+		werr := pkgerrors.Wrapf(err, "redis unlock failed")
 		if l.onUnlock != nil {
 			l.onUnlock(key, werr)
 		}
@@ -356,14 +356,14 @@ func (l *RedisLocker) Renew(ctx context.Context, key, ownerID string, ttl time.D
 		return true, nil
 	}
 	if l.client == nil {
-		return false, fmt.Errorf("distlock: redis client is nil (construct with a client or enable WithGracefulDegradation)")
+		return false, pkgerrors.New("distlock: redis client is nil (construct with a client or enable WithGracefulDegradation)")
 	}
 	if ttl <= 0 {
-		return false, fmt.Errorf("distlock: ttl must be positive, got %v", ttl)
+		return false, pkgerrors.Newf("distlock: ttl must be positive, got %v", ttl)
 	}
 	result, err := renewScript.Run(ctx, l.client, []string{l.lockKey(key)}, ownerID, ttlMillis(ttl)).Int()
 	if err != nil {
-		return false, fmt.Errorf("redis renew failed: %w", err)
+		return false, pkgerrors.Wrapf(err, "redis renew failed")
 	}
 	return result == 1, nil
 }
