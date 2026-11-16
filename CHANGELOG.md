@@ -1,3 +1,7 @@
+## [v0.16.3] — 2026-11-16
+
+- refactor: fmt.Errorf → oekit/pkg/errors 三形态对位替换（#520 替换波）+ 依赖地板抬至 pkg v0.52.0。文案逐字节同形（测试断言零修改），多 %w/%w 居中/哨兵前置形态按仓规保留
+
 ## [v0.16.2] — 2026-11-15
 
 - fix: BruteForceGuard 补幂等 Close(ctx)（未触发降级 no-op、已构建关清扫 goroutine，Close 后 Fail/Check/Reset 返回 ErrGuardClosed 不再懒构建，#221）；Fail 增 FailWithResult 返回 FailResult{Count,Locked,NewlyLocked,Remain} 携带「本次刚触发」跃迁（Lua SET NX/PTTL 精确判定，16 并发恰好 1 个 NewlyLocked），旧 Fail 委托新方法签名行为不变（#222）
