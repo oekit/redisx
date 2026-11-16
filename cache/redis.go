@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/oekit/logx"
 	"github.com/oekit/pkg/cache"
+	pkgerrors "github.com/oekit/pkg/errors"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -126,7 +126,7 @@ func (c *RedisCache[T]) getInternal(ctx context.Context, key string) (*T, bool, 
 		if errors.Is(err, redis.Nil) {
 			return nil, false, nil
 		}
-		return nil, false, fmt.Errorf("cache get: %w", err)
+		return nil, false, pkgerrors.Wrapf(err, "cache get")
 	}
 
 	// 空值标记命中（仅认精确哨兵）：ekit 写入的 null marker 是 nullValue
@@ -232,7 +232,7 @@ func (c *RedisCache[T]) Set(ctx context.Context, key string, value *T) error {
 
 	data, err := c.cfg.Serializer(value)
 	if err != nil {
-		return fmt.Errorf("cache serialize: %w", err)
+		return pkgerrors.Wrapf(err, "cache serialize")
 	}
 
 	return c.client.Set(ctx, fullKey, data, c.effectiveTTL()).Err()
@@ -259,13 +259,13 @@ func (c *RedisCache[T]) effectiveTTL() time.Duration {
 // 调用方 bug，响亮拒绝，不猜缺省也不写永久键。
 func (c *RedisCache[T]) SetWithTTL(ctx context.Context, key string, value *T, ttl time.Duration) error {
 	if ttl <= 0 {
-		return fmt.Errorf("cache SetWithTTL: ttl 必须 > 0（得到 %s）——0 会经 go-redis 写成永久键，与 Set 的 24h 缺省口径冲突（#113）", ttl)
+		return pkgerrors.Newf("cache SetWithTTL: ttl 必须 > 0（得到 %s）——0 会经 go-redis 写成永久键，与 Set 的 24h 缺省口径冲突（#113）", ttl)
 	}
 	fullKey := c.fullKey(key)
 
 	data, err := c.cfg.Serializer(value)
 	if err != nil {
-		return fmt.Errorf("cache serialize: %w", err)
+		return pkgerrors.Wrapf(err, "cache serialize")
 	}
 
 	return c.client.Set(ctx, fullKey, data, ttl).Err()
@@ -284,7 +284,7 @@ func (c *RedisCache[T]) SetWithTTL(ctx context.Context, key string, value *T, tt
 // 也不写永久键。
 func (c *RedisCache[T]) SetRaw(ctx context.Context, key string, data []byte, ttl time.Duration) error {
 	if ttl <= 0 {
-		return fmt.Errorf("cache SetRaw: ttl 必须 > 0（得到 %s）——0 会经 go-redis 写成永久键，与 Set 的 24h 缺省口径冲突（#113/#172）", ttl)
+		return pkgerrors.Newf("cache SetRaw: ttl 必须 > 0（得到 %s）——0 会经 go-redis 写成永久键，与 Set 的 24h 缺省口径冲突（#113/#172）", ttl)
 	}
 	return c.client.Set(ctx, c.fullKey(key), data, ttl).Err()
 }
@@ -324,7 +324,7 @@ func (c *RedisCache[T]) MGet(ctx context.Context, keys ...string) (map[string]*T
 	}
 	res, err := c.client.MGet(ctx, fullKeys...).Result()
 	if err != nil {
-		return nil, fmt.Errorf("cache mget: %w", err)
+		return nil, pkgerrors.Wrapf(err, "cache mget")
 	}
 
 	out := make(map[string]*T, len(keys))
@@ -379,10 +379,10 @@ func (c *RedisCache[T]) Exists(ctx context.Context, key string) (bool, error) {
 // 的是旧值，旧值冒充刷新结果返回同样是错误面断裂；中止即中止，调用方可重试。
 func (c *RedisCache[T]) Refresh(ctx context.Context, key string) (*T, error) {
 	if c.cfg.Source == nil {
-		return nil, fmt.Errorf("cache Refresh: Source not configured")
+		return nil, pkgerrors.New("cache Refresh: Source not configured")
 	}
 	if err := c.Del(ctx, key); err != nil {
-		return nil, fmt.Errorf("cache refresh del: %w", err)
+		return nil, pkgerrors.Wrapf(err, "cache refresh del")
 	}
 	return c.GetOrLoad(ctx, key)
 }
