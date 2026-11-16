@@ -2,9 +2,9 @@ package distlock
 
 import (
 	"context"
-	"fmt"
 	"time"
 
+	"github.com/oekit/pkg/errors"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -132,16 +132,16 @@ func (l *Lockout) keys(key string) []string {
 // validate 构造参数与运行条件的统一 fail-fast 校验。
 func (l *Lockout) validate() error {
 	if l.client == nil {
-		return fmt.Errorf("distlock: lockout requires a non-nil redis client (no graceful degradation for brute-force semantics)")
+		return errors.New("distlock: lockout requires a non-nil redis client (no graceful degradation for brute-force semantics)")
 	}
 	if l.cfg.Threshold < 1 {
-		return fmt.Errorf("distlock: lockout threshold must be positive, got %d", l.cfg.Threshold)
+		return errors.Newf("distlock: lockout threshold must be positive, got %d", l.cfg.Threshold)
 	}
 	if l.cfg.Window <= 0 {
-		return fmt.Errorf("distlock: lockout window must be positive, got %v", l.cfg.Window)
+		return errors.Newf("distlock: lockout window must be positive, got %v", l.cfg.Window)
 	}
 	if l.cfg.Penalty <= 0 {
-		return fmt.Errorf("distlock: lockout penalty must be positive, got %v", l.cfg.Penalty)
+		return errors.Newf("distlock: lockout penalty must be positive, got %v", l.cfg.Penalty)
 	}
 	return nil
 }
@@ -154,7 +154,7 @@ func (l *Lockout) validate() error {
 // 失败计数每次写完即蒸发，防爆破锁永不触发（与续期 TTL 的 #54 同族护栏）。
 func (l *Lockout) Fail(ctx context.Context, key string) (int64, error) {
 	if key == "" {
-		return 0, fmt.Errorf("distlock: lockout key must not be empty")
+		return 0, errors.New("distlock: lockout key must not be empty")
 	}
 	if err := l.validate(); err != nil {
 		return 0, err
@@ -175,11 +175,11 @@ func (l *Lockout) failState(ctx context.Context, key string) (count int64, locke
 		l.now().UnixMilli(), ttlMillis(l.cfg.Window), l.cfg.Threshold,
 		ttlMillis(l.cfg.Penalty)).Result()
 	if err != nil {
-		return 0, false, false, 0, fmt.Errorf("redis lockout fail failed: %w", err)
+		return 0, false, false, 0, errors.Wrapf(err, "redis lockout fail failed")
 	}
 	vals, ok := res.([]any)
 	if !ok || len(vals) != 4 {
-		return 0, false, false, 0, fmt.Errorf("redis lockout fail: unexpected reply %v", res)
+		return 0, false, false, 0, errors.Newf("redis lockout fail: unexpected reply %v", res)
 	}
 	count, _ = vals[0].(int64)
 	if v, ok := vals[1].(int64); ok && v == 1 {
@@ -198,18 +198,18 @@ func (l *Lockout) failState(ctx context.Context, key string) (count int64, locke
 // （供对外 429 文案），未锁定返回 (false, 0, nil)。
 func (l *Lockout) Check(ctx context.Context, key string) (bool, time.Duration, error) {
 	if key == "" {
-		return false, 0, fmt.Errorf("distlock: lockout key must not be empty")
+		return false, 0, errors.New("distlock: lockout key must not be empty")
 	}
 	if err := l.validate(); err != nil {
 		return false, 0, err
 	}
 	res, err := lockoutCheckScript.Run(ctx, l.client, l.keys(key)).Result()
 	if err != nil {
-		return false, 0, fmt.Errorf("redis lockout check failed: %w", err)
+		return false, 0, errors.Wrapf(err, "redis lockout check failed")
 	}
 	vals, ok := res.([]any)
 	if !ok || len(vals) != 2 {
-		return false, 0, fmt.Errorf("redis lockout check: unexpected reply %v", res)
+		return false, 0, errors.Newf("redis lockout check: unexpected reply %v", res)
 	}
 	if v, ok := vals[0].(int64); ok && v == 1 {
 		ttl, _ := vals[1].(int64)
@@ -222,14 +222,14 @@ func (l *Lockout) Check(ctx context.Context, key string) (bool, time.Duration, e
 // key 未登记为 no-op（DEL 幂等）。
 func (l *Lockout) Reset(ctx context.Context, key string) error {
 	if key == "" {
-		return fmt.Errorf("distlock: lockout key must not be empty")
+		return errors.New("distlock: lockout key must not be empty")
 	}
 	if err := l.validate(); err != nil {
 		return err
 	}
 	_, err := lockoutResetScript.Run(ctx, l.client, l.keys(key)).Result()
 	if err != nil {
-		return fmt.Errorf("redis lockout reset failed: %w", err)
+		return errors.Wrapf(err, "redis lockout reset failed")
 	}
 	return nil
 }

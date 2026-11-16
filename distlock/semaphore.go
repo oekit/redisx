@@ -2,11 +2,11 @@ package distlock
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
 	"github.com/oekit/logx"
+	"github.com/oekit/pkg/errors"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -174,13 +174,13 @@ func (s *Semaphore) logr() logx.Logger {
 // validate 构造参数与运行条件的统一 fail-fast 校验。
 func (s *Semaphore) validate() error {
 	if s.client == nil {
-		return fmt.Errorf("distlock: semaphore requires a non-nil redis client (no graceful degradation for quota semantics)")
+		return errors.New("distlock: semaphore requires a non-nil redis client (no graceful degradation for quota semantics)")
 	}
 	if s.max <= 0 {
-		return fmt.Errorf("distlock: semaphore max must be positive, got %d", s.max)
+		return errors.Newf("distlock: semaphore max must be positive, got %d", s.max)
 	}
 	if s.slotTTL <= 0 {
-		return fmt.Errorf("distlock: semaphore slotTTL must be positive, got %v", s.slotTTL)
+		return errors.Newf("distlock: semaphore slotTTL must be positive, got %v", s.slotTTL)
 	}
 	return nil
 }
@@ -193,7 +193,7 @@ func (s *Semaphore) validate() error {
 // （同一 identifier 重复 Acquire 会重启 watchdog，旧 goroutine 被安全停掉）。
 func (s *Semaphore) Acquire(ctx context.Context, identifier string) (bool, error) {
 	if identifier == "" {
-		return false, fmt.Errorf("distlock: semaphore identifier must not be empty")
+		return false, errors.New("distlock: semaphore identifier must not be empty")
 	}
 	if err := s.validate(); err != nil {
 		return false, err
@@ -202,7 +202,7 @@ func (s *Semaphore) Acquire(ctx context.Context, identifier string) (bool, error
 	ok, err := semaphoreAcquireScript.Run(ctx, s.client, []string{s.key},
 		identifier, now.UnixMilli(), now.Add(s.slotTTL).UnixMilli(), s.max).Int()
 	if err != nil {
-		return false, fmt.Errorf("redis semaphore acquire failed: %w", err)
+		return false, errors.Wrapf(err, "redis semaphore acquire failed")
 	}
 	if ok == 1 && s.autoRenew {
 		s.startAutoRenew(identifier)
@@ -216,7 +216,7 @@ func (s *Semaphore) Acquire(ctx context.Context, identifier string) (bool, error
 // error 表示 Redis 通信故障，可重试。
 func (s *Semaphore) Renew(ctx context.Context, identifier string) (bool, error) {
 	if identifier == "" {
-		return false, fmt.Errorf("distlock: semaphore identifier must not be empty")
+		return false, errors.New("distlock: semaphore identifier must not be empty")
 	}
 	if err := s.validate(); err != nil {
 		return false, err
@@ -225,7 +225,7 @@ func (s *Semaphore) Renew(ctx context.Context, identifier string) (bool, error) 
 	ok, err := semaphoreRenewScript.Run(ctx, s.client, []string{s.key},
 		identifier, now.UnixMilli(), now.Add(s.slotTTL).UnixMilli()).Int()
 	if err != nil {
-		return false, fmt.Errorf("redis semaphore renew failed: %w", err)
+		return false, errors.Wrapf(err, "redis semaphore renew failed")
 	}
 	return ok == 1, nil
 }
@@ -239,14 +239,14 @@ func (s *Semaphore) Renew(ctx context.Context, identifier string) (bool, error) 
 // 通信故障时 watchdog 继续续期兜底（槽位可能仍在），调用方可重试 Release。
 func (s *Semaphore) Release(ctx context.Context, identifier string) error {
 	if identifier == "" {
-		return fmt.Errorf("distlock: semaphore identifier must not be empty")
+		return errors.New("distlock: semaphore identifier must not be empty")
 	}
 	if err := s.validate(); err != nil {
 		return err
 	}
 	_, err := semaphoreReleaseScript.Run(ctx, s.client, []string{s.key}, identifier).Result()
 	if err != nil {
-		return fmt.Errorf("redis semaphore release failed: %w", err)
+		return errors.Wrapf(err, "redis semaphore release failed")
 	}
 	s.stopAutoRenew(identifier)
 	return nil
@@ -264,7 +264,7 @@ func (s *Semaphore) Cleanup(ctx context.Context, olderThan time.Duration) (int64
 	threshold := s.now().Add(-olderThan).UnixMilli()
 	n, err := semaphoreCleanupScript.Run(ctx, s.client, []string{s.key}, threshold).Int64()
 	if err != nil {
-		return 0, fmt.Errorf("redis semaphore cleanup failed: %w", err)
+		return 0, errors.Wrapf(err, "redis semaphore cleanup failed")
 	}
 	return n, nil
 }

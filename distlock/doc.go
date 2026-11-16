@@ -109,7 +109,7 @@
 //
 //	ownerID, err := locker.Lock(ctx, "deploy:"+env, 5*time.Minute, 10*time.Minute)
 //	if err != nil {
-//	    return fmt.Errorf("获取部署锁失败: %w", err)
+//	    return errors.Wrapf(err, "获取部署锁失败")
 //	}
 //	defer locker.Unlock(ctx, "deploy:"+env, ownerID)
 //	return runDeploy(env)
