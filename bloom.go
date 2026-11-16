@@ -2,7 +2,8 @@ package redisx
 
 import (
 	"context"
-	"fmt"
+
+	"github.com/oekit/pkg/errors"
 )
 
 // BloomFilter 是基于 RedisBloom 的布隆过滤器封装。
@@ -41,7 +42,7 @@ func (c *Client) NewBloomFilter(ctx context.Context, key string, errorRate float
 	err := c.client.Do(ctx, "BF.RESERVE", c.convertKey(key), errorRate, capacity).Err()
 	if err != nil {
 		if infoErr := c.client.Do(ctx, "BF.INFO", c.convertKey(key)).Err(); infoErr != nil {
-			return nil, fmt.Errorf("create bloom filter: %w", err)
+			return nil, errors.Wrapf(err, "create bloom filter")
 		}
 		// INFO 成功 ⇒ 过滤器确实已存在：复用既有实例（参数以既有为准，见 godoc）
 	}
@@ -105,7 +106,7 @@ func (bf *BloomFilter) Info(ctx context.Context) (map[string]any, error) {
 	val := cmd.Val()
 	arr, ok := val.([]any)
 	if !ok {
-		return nil, fmt.Errorf("unexpected BF.INFO response type: %T", val)
+		return nil, errors.Newf("unexpected BF.INFO response type: %T", val)
 	}
 
 	info := make(map[string]any, len(arr)/2)

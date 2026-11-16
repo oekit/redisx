@@ -3,9 +3,10 @@ package redisx
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"strconv"
+
+	pkgerrors "github.com/oekit/pkg/errors"
 )
 
 // RedisConfig 是 Redis 连接配置，可直接从 YAML 反序列化。
@@ -37,10 +38,10 @@ type RedisConfig struct {
 //	})
 func NewClientFromConfig(ctx context.Context, cfg RedisConfig) (*Client, error) {
 	if cfg.Host == "" {
-		return nil, fmt.Errorf("redisx: redis host is empty (config key redis.host)")
+		return nil, pkgerrors.New("redisx: redis host is empty (config key redis.host)")
 	}
 	if cfg.Port < 1 || cfg.Port > 65535 {
-		return nil, fmt.Errorf("redisx: redis port %d out of range 1..65535 (config key redis.port)", cfg.Port)
+		return nil, pkgerrors.Newf("redisx: redis port %d out of range 1..65535 (config key redis.port)", cfg.Port)
 	}
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	client, err := NewClientFromAddr(addr, cfg.Password, cfg.DB)
@@ -65,11 +66,11 @@ func pingOrCleanup(ctx context.Context, client *Client) error {
 	if err := client.Ping(ctx).Err(); err != nil {
 		if cerr := client.Close(ctx); cerr != nil {
 			return errors.Join(
-				fmt.Errorf("redis ping failed: %w", err),
-				fmt.Errorf("redis close failed: %w", cerr),
+				pkgerrors.Wrapf(err, "redis ping failed"),
+				pkgerrors.Wrapf(cerr, "redis close failed"),
 			)
 		}
-		return fmt.Errorf("redis ping failed: %w", err)
+		return pkgerrors.Wrapf(err, "redis ping failed")
 	}
 	return nil
 }

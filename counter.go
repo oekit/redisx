@@ -3,9 +3,9 @@ package redisx
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
+	pkgerrors "github.com/oekit/pkg/errors"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -60,7 +60,7 @@ func (ct *Counter) DecrFloor(ctx context.Context, delta int64, floor int64) (int
 	// 前缀感知路径操作不同的物理 key（配额读写分裂）。
 	val, err := decrFloorLua.Run(ctx, ct.client.client, []string{ct.client.convertKey(ct.key)}, delta, floor).Int64()
 	if err != nil {
-		return 0, fmt.Errorf("decr floor: %w", err)
+		return 0, pkgerrors.Wrapf(err, "decr floor")
 	}
 	return val, nil
 }
@@ -98,11 +98,11 @@ return val
 func (ct *Counter) IncrWithTTL(ctx context.Context, delta int64, ttl time.Duration) (int64, error) {
 	ms := ttl.Milliseconds()
 	if ms <= 0 {
-		return 0, fmt.Errorf("incr with ttl: ttl 必须为正（得到 %v）", ttl)
+		return 0, pkgerrors.Newf("incr with ttl: ttl 必须为正（得到 %v）", ttl)
 	}
 	val, err := incrWithTTLLua.Run(ctx, ct.client.client, []string{ct.client.convertKey(ct.key)}, delta, ms).Int64()
 	if err != nil {
-		return 0, fmt.Errorf("incr with ttl: %w", err)
+		return 0, pkgerrors.Wrapf(err, "incr with ttl")
 	}
 	return val, nil
 }
