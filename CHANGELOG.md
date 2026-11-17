@@ -1,3 +1,7 @@
+## [v0.16.4] — 2026-11-18
+
+- distlock 锁 value 迁 stringx.RandomToken 单源、续期安全网迁 pkg/distlock.MaxLifetime(pkg v0.53.0 原语);行为不变(编码对拍一致)
+
 ## [v0.16.3] — 2026-11-16
 
 - refactor: fmt.Errorf → oekit/pkg/errors 三形态对位替换（#520 替换波）+ 依赖地板抬至 pkg v0.52.0。文案逐字节同形（测试断言零修改），多 %w/%w 居中/哨兵前置形态按仓规保留
