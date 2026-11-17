@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/oekit/logx"
+	pkgdistlock "github.com/oekit/pkg/distlock"
 	"github.com/oekit/pkg/errors"
 	"github.com/redis/go-redis/v9"
 )
@@ -284,7 +285,8 @@ func (s *Semaphore) Cleanup(ctx context.Context, olderThan time.Duration) (int64
 func (s *Semaphore) startAutoRenew(identifier string) {
 	w := newRenewWatchdog(&s.sessions, identifier, identifier)
 	w.interval = renewIntervalFrom(s.renewInterval, s.slotTTL)
-	w.maxLifetime = renewMaxLifetime(s.maxAutoRenew, s.slotTTL)
+	// 三态口径单源:pkg/distlock.MaxLifetime(0→10×ttl、负→0 不限、正→显式)。
+	w.maxLifetime = pkgdistlock.MaxLifetime(s.maxAutoRenew, s.slotTTL)
 	w.renew = func(ctx context.Context) (bool, error) {
 		return s.Renew(ctx, identifier)
 	}
