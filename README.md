@@ -11,7 +11,7 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/redisx@v0.16.2
+go get github.com/oekit/redisx@v0.16.3
 ```
 
 ## 这个仓库做什么
