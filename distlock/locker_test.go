@@ -21,24 +21,6 @@ func TestLocker_LockKey_DefaultPrefix(t *testing.T) {
 	}
 }
 
-func TestLocker_GenerateValue(t *testing.T) {
-	l := NewRedisLocker(nil)
-	v1, err := l.generateValue()
-	if err != nil {
-		t.Fatalf("generateValue() error: %v", err)
-	}
-	v2, err := l.generateValue()
-	if err != nil {
-		t.Fatalf("generateValue() error: %v", err)
-	}
-	if v1 == v2 {
-		t.Error("expected unique values")
-	}
-	if len(v1) == 0 {
-		t.Error("expected non-empty value")
-	}
-}
-
 func TestWithGracefulDegradation_TryLock(t *testing.T) {
 	l := NewRedisLocker(nil, WithGracefulDegradation())
 	ownerID, err := l.TryLock(context.TODO(), "key", time.Minute)

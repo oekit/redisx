@@ -33,7 +33,7 @@ type renewWatchdog struct {
 	// 调用方 ctx 取消不中断续期。
 	renewCtx context.Context
 	// interval 续期间隔（[renewIntervalFrom] 推导）；maxLifetime 续期最大
-	// 生命周期（[renewMaxLifetime] 三态，0 = 无 deadline）。
+	// 生命周期（pkg/distlock.MaxLifetime 三态，0 = 无 deadline）。
 	interval    time.Duration
 	maxLifetime time.Duration
 	// renew 单次续期：true = 成功；false = 锁/槽已丢失（watchdog 必须退出，
@@ -150,17 +150,7 @@ func renewIntervalFrom(configured, ttl time.Duration) time.Duration {
 	return interval
 }
 
-// renewMaxLifetime 计算续期最大生命周期（#159 单源，三态）：
-// 0（未设置）= 10×ttl；负值 = 不限制（返回 0 表示无 deadline）；正值 = 显式
-// 上限。忘 Unlock/Release 时续期到期自行退出，锁/槽在 TTL 后自然过期回收
-// ——不形成永久持锁 + goroutine 泄漏（TTL 安全网重新生效）。
-func renewMaxLifetime(configured, ttl time.Duration) time.Duration {
-	switch {
-	case configured == 0:
-		return 10 * ttl
-	case configured < 0:
-		return 0
-	default:
-		return configured
-	}
-}
+// renewMaxLifetime 的三态逻辑（#159：0（未设置）= 10×ttl；负值 = 不限制
+// （返回 0 表示无 deadline）；正值 = 显式上限）已随 #534 收敛进
+// pkg/distlock.MaxLifetime——单源:pkg/distlock.MaxLifetime。
+// 调用点：RedisLocker.startAutoRenew 与 Semaphore.startAutoRenew。

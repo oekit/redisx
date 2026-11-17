@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	pkgdistlock "github.com/oekit/pkg/distlock"
 )
 
 // --- #159：watchdog 状态机单源后的共享行为钉 ---
@@ -54,6 +56,9 @@ func TestRenewIntervalFrom(t *testing.T) {
 	}
 }
 
+// TestRenewMaxLifetime 三态语义已单源进 pkg/distlock.MaxLifetime（本仓本地
+// 实现删除）；用例保留为消费侧契约钉——pkg 实现若与 redisx 历史口径漂移
+// （0→10×ttl、负→0 表不限、正→显式），本测试即红。
 func TestRenewMaxLifetime(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -67,8 +72,8 @@ func TestRenewMaxLifetime(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := renewMaxLifetime(tc.configured, tc.ttl); got != tc.want {
-				t.Fatalf("renewMaxLifetime(%v, %v) = %v, want %v", tc.configured, tc.ttl, got, tc.want)
+			if got := pkgdistlock.MaxLifetime(tc.configured, tc.ttl); got != tc.want {
+				t.Fatalf("MaxLifetime(%v, %v) = %v, want %v", tc.configured, tc.ttl, got, tc.want)
 			}
 		})
 	}

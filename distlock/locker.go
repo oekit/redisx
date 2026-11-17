@@ -2,8 +2,6 @@ package distlock
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"sync"
 	"time"
@@ -11,6 +9,7 @@ import (
 	"github.com/oekit/logx"
 	pkgdistlock "github.com/oekit/pkg/distlock"
 	pkgerrors "github.com/oekit/pkg/errors"
+	stringx "github.com/oekit/pkg/stringx"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -208,14 +207,6 @@ func (l *RedisLocker) lockKey(key string) string {
 	return l.prefix + ":" + key
 }
 
-func (l *RedisLocker) generateValue() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return "", pkgerrors.Wrapf(err, "crypto/rand.Read failed")
-	}
-	return base64.StdEncoding.EncodeToString(b), nil
-}
-
 // TryLock 尝试获取分布式锁（非阻塞，单次尝试）。
 // 返回 (ownerID, nil) 表示成功，ownerID 用于后续 Unlock。
 // 返回 ("", ErrLockNotAcquired) 表示锁被占用。
@@ -240,7 +231,10 @@ func (l *RedisLocker) TryLock(ctx context.Context, key string, ttl time.Duration
 		return "", pkgerrors.New("distlock: redis client is nil (construct with a client or enable WithGracefulDegradation)")
 	}
 
-	value, err := l.generateValue()
+	// 锁 value 单源:pkg/stringx.RandomToken(16B → base64.StdEncoding,含
+	// padding)——与旧 generateValue 编码值域逐字节一致(对拍已验);随机源
+	// 失败 error 原样上抛,不静默退化。
+	value, err := stringx.RandomToken(16, stringx.TokenBase64Std)
 	if err != nil {
 		return "", err
 	}
@@ -473,7 +467,8 @@ func (l *RedisLocker) startAutoRenew(_ context.Context, key string, ownerID stri
 	}
 
 	w.interval = renewIntervalFrom(l.renewInterval, ttl)
-	w.maxLifetime = renewMaxLifetime(l.maxAutoRenew, ttl)
+	// 三态口径单源:pkg/distlock.MaxLifetime(0→10×ttl、负→0 不限、正→显式)。
+	w.maxLifetime = pkgdistlock.MaxLifetime(l.maxAutoRenew, ttl)
 	w.renew = func(ctx context.Context) (bool, error) {
 		result, err := renewScript.Run(ctx, l.client, []string{l.lockKey(key)}, ownerID, ttlMillis(ttl)).Int()
 		if err != nil {
