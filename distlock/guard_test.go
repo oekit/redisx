@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"runtime"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -316,36 +315,33 @@ func TestBruteForceGuard_ValidationFailFast(t *testing.T) {
 	}
 }
 
-// countLockoutCleanupGoroutines 统计存活的进程内 Lockout 清扫 goroutine
-// （按栈帧匹配，不受其他后台 goroutine 数量噪声影响）——Close 释放断言的
-// 探针（redisx#221 验收：Close 后清扫 goroutine 数回到基线）。
-func countLockoutCleanupGoroutines() int {
-	buf := make([]byte, 1<<20)
-	n := runtime.Stack(buf, true)
-	count := 0
-	for _, block := range strings.Split(string(buf[:n]), "\n\n") {
-		if strings.Contains(block, "ratelimit.(*LockoutOf[") && strings.Contains(block, ".cleanup") {
-			count++
-		}
-	}
-	return count
-}
-
-// waitLockoutCleanupGoroutines 轮询等待清扫 goroutine 数达到 want（goroutine
-// 退出是异步的；超时即判泄漏）。窗口放宽到 15s：CI 满载下 goroutine 退出
-// 可能显著慢于本地，3s 曾导致 TestBruteForceGuard_CloseStopsFallbackCleanup
-// 偶发误报泄漏；正常路径下仍为立即返回，不影响测试通过速度。
-func waitLockoutCleanupGoroutines(t *testing.T, want int) {
+// waitSteadyNumGoroutine 等待进程 goroutine 总数进入稳态并返回该值：连续
+// steadySamples 次采样同值即认为稳定（goroutine 出生/退出是异步的；降级层
+// 构建与 Close 释放均在毫秒级完成，CI 满载下可能显著变慢——窗口放宽到
+// 15s，沿袭轮询窗口 3s→15s 的教训；超时返回末次采样值交调用方断言报错）。
+func waitSteadyNumGoroutine(t *testing.T) int {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
-	for {
-		if got := countLockoutCleanupGoroutines(); got == want {
-			return
-		} else if time.Now().After(deadline) {
-			t.Fatalf("process-local Lockout cleanup goroutines = %d, want %d (goroutine leak)", got, want)
+	const (
+		steadySamples = 3
+		interval      = 100 * time.Millisecond
+		window        = 15 * time.Second
+	)
+	last := runtime.NumGoroutine()
+	streak := 1
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		time.Sleep(interval)
+		if cur := runtime.NumGoroutine(); cur == last {
+			streak++
+			if streak >= steadySamples {
+				return cur
+			}
+		} else {
+			last = cur
+			streak = 1
 		}
-		time.Sleep(50 * time.Millisecond)
 	}
+	return last
 }
 
 // TestBruteForceGuard_CloseIdempotentWithoutFallback 回归（redisx#221 验收②）：
@@ -374,18 +370,33 @@ func TestBruteForceGuard_CloseIdempotentWithoutFallback(t *testing.T) {
 
 // TestBruteForceGuard_CloseStopsFallbackCleanup 回归（redisx#221 验收①）：
 // 构造 → 触发一次降级（miniredis 关闭，惰性构建进程内 Lockout）→ Close →
-// 清扫 goroutine 数回到基线；重复 Close 幂等；Close 后即便 Redis 仍故障也
-// 不得再懒构建降级层（不新增 goroutine）。
+// 进程 goroutine 足迹回到降级前稳态（清扫 goroutine 无泄漏）；重复 Close
+// 幂等；Close 后即便 Redis 仍故障也不得再懒构建降级层（无新 goroutine）。
+//
+// 断言用 runtime.NumGoroutine 稳态对比而非清扫 goroutine 栈帧计数：帧名
+// 探针耦合 concurrency 内部实现，v0.39.1（concurrency#363）把清扫循环收编
+// 进 keyedTTLRegistry 后，栈帧从 ratelimit.(*LockoutOf[...]).cleanup 变为
+// ratelimit.(*keyedTTLRegistry[...]).cleanup，探针恒为 0（#238 CI 实测
+// 16.74s 误报泄漏）。收编前后生命周期语义一致（构造即启动、Close 即停、
+// 幂等），稳态足迹对比对任一实现形态都成立且零内部耦合。
 func TestBruteForceGuard_CloseStopsFallbackCleanup(t *testing.T) {
 	ctx := context.Background()
-	baseline := countLockoutCleanupGoroutines()
 
 	g, mr := newGuardTest(t, true)
+
+	// 基线在 miniredis 关停后采样：服务端 goroutine 的退出噪声先沉降，
+	// 后续每个稳态点只反映降级层的生命周期。
 	mr.Close() // Redis 故障：触发降级路径
+	baseline := waitSteadyNumGoroutine(t)
+
 	if _, err := g.Fail(ctx, "user:42"); err != nil {
 		t.Fatalf("degraded fail: %v", err)
 	}
-	waitLockoutCleanupGoroutines(t, baseline+1) // 惰性构建带来一个清扫 goroutine
+	// 正向对照：惰性构建恰好带来一个后台清扫 goroutine——保证后续
+	// 「Close 回到基线」不是空洞通过（降级层确实持有可泄漏面）。
+	if got := waitSteadyNumGoroutine(t); got != baseline+1 {
+		t.Fatalf("goroutines after fallback build = %d, want baseline+1 = %d", got, baseline+1)
+	}
 
 	if err := g.Close(ctx); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -393,7 +404,10 @@ func TestBruteForceGuard_CloseStopsFallbackCleanup(t *testing.T) {
 	if err := g.Close(ctx); err != nil {
 		t.Fatalf("second Close must be idempotent: %v", err)
 	}
-	waitLockoutCleanupGoroutines(t, baseline) // 清扫 goroutine 已释放
+	// 清扫 goroutine 已释放：足迹回落基线（不泄漏）。
+	if got := waitSteadyNumGoroutine(t); got != baseline {
+		t.Fatalf("goroutines after Close = %d, want baseline %d (goroutine leak)", got, baseline)
+	}
 
 	// Close 后 Redis 仍故障：调用明确报错，且不得再构建降级层。
 	if _, err := g.Fail(ctx, "user:42"); !errors.Is(err, ErrGuardClosed) {
@@ -405,7 +419,13 @@ func TestBruteForceGuard_CloseStopsFallbackCleanup(t *testing.T) {
 	if err := g.Reset(ctx, "user:42"); !errors.Is(err, ErrGuardClosed) {
 		t.Fatalf("Reset after Close = %v, want ErrGuardClosed", err)
 	}
-	waitLockoutCleanupGoroutines(t, baseline) // 无新增清扫 goroutine
+	// memFor 直验构建门：关后连降级层的懒构建入口都已封死。
+	if _, err := g.memFor(); !errors.Is(err, ErrGuardClosed) {
+		t.Fatalf("memFor after Close = %v, want ErrGuardClosed", err)
+	}
+	if got := waitSteadyNumGoroutine(t); got != baseline {
+		t.Fatalf("goroutines after closed reuse = %d, want baseline %d (no new cleanup goroutine)", got, baseline)
+	}
 }
 
 // TestBruteForceGuard_FailWithResultTransition 回归（redisx#222 验收①②）：
