@@ -332,17 +332,19 @@ func countLockoutCleanupGoroutines() int {
 }
 
 // waitLockoutCleanupGoroutines 轮询等待清扫 goroutine 数达到 want（goroutine
-// 退出是异步的；超时即判泄漏）。
+// 退出是异步的；超时即判泄漏）。窗口放宽到 15s：CI 满载下 goroutine 退出
+// 可能显著慢于本地，3s 曾导致 TestBruteForceGuard_CloseStopsFallbackCleanup
+// 偶发误报泄漏；正常路径下仍为立即返回，不影响测试通过速度。
 func waitLockoutCleanupGoroutines(t *testing.T, want int) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for {
 		if got := countLockoutCleanupGoroutines(); got == want {
 			return
 		} else if time.Now().After(deadline) {
 			t.Fatalf("process-local Lockout cleanup goroutines = %d, want %d (goroutine leak)", got, want)
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
