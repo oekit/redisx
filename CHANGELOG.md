@@ -1,3 +1,9 @@
+## [v0.16.5] — 2026-11-19
+
+- - refactor: ratelimit per-key 桶缓存两份逐字同构收敛——PeriodLimit.bucketFor 与 ResilientLimiter.localFor 下沉 bucketCache 单类型（sync.Map + build 闭包注入，含 once 单飞、nil 不缓存、清扫合一）；#166 时代修 singleflight 需双侧打补丁的漂移结构根除，既有 #125/#127/#166/#167 回归全绿（#242）
+
+关联问题单：redisx#242。
+
 ## [v0.16.4] — 2026-11-18
 
 - distlock 锁 value 迁 stringx.RandomToken 单源、续期安全网迁 pkg/distlock.MaxLifetime(pkg v0.53.0 原语);行为不变(编码对拍一致)
