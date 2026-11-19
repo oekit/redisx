@@ -22,6 +22,22 @@ import (
 // 本类型不暴露它们（编译期即拦截）；需要时用 Raw() 拿底层裸 Pipeliner
 // （不做键转换，键名请自行处理），或在本仓补一层封装。
 //
+// 非事务语义（redisx#248）：go-redis 的 Pipeline **不是 MULTI/EXEC 事务**——
+// 它只是把多条命令并成一次网络往返，服务端仍**逐条独立执行**：
+//   - 无 all-or-nothing：管道中某条命令命令级失败（OOM / maxmemory 逐出 /
+//     WRONGTYPE…）**不中断**后续命令，其余命令照常执行；
+//   - 无回滚：Exec 返回错误时**已执行的命令不回滚**，效果原样留存；
+//   - 因此 Exec/ExecChecked 全绿只代表「每条命令的回复非错误」，不构成
+//     原子性承诺——跨多键的不变量（A 写成功则 B 必写 / 加减两键必须同涨）
+//     不得押注在管道整体上。
+//
+// 真需要原子性时走 Lua 治本（本类型的 Eval/EvalSha 直通单脚本原子执行）：
+// 先例见 timertask/redis 回投路径（timertask#150/#157）——「先回投成功再摘
+// 租约」不能靠同一条 pipeline 的命令顺序实现，ZAdd 命令级失败而 ZRem 照常
+// 执行会让任务两边俱失且不进死信；改为脚本内 redis.call 出错即中止（后续
+// 命令不执行）后两条半失败腿都不丢任务。注意 Lua 的原子性同样**不含回滚**：
+// 脚本中途出错时已执行的 redis.call 不回滚，脚本须按「失败可重试/幂等」设计。
+//
 // GetDelCompat 的 <6.2 回退不提供管道版：unknown command 只在 Exec 时才暴露，
 // 无法在排队期选择回退路径；老 Redis 请用单发 Client.GetDelCompat。
 type Pipeline struct {
@@ -37,6 +53,9 @@ func (p *Pipeline) Raw() redis.Pipeliner {
 
 // Exec 执行管道中排队的全部命令，返回各命令的结果。
 //
+// 管道非事务、逐条独立执行、失败不回滚已执行命令（redisx#248，详见类型
+// godoc「非事务语义」）——本方法的错误口径不改变该语义。
+//
 // 错误口径（redisx#214）：返回的 error 是 go-redis 的**首条命令错误**
 // （cmdsFirstErr，command.go:263）——多条命令部分失败时只有排在最前的那条
 // 进 err，其余错误只在返回的 []redis.Cmder 上逐条可查；首条恰为 redis.Nil
@@ -49,6 +68,9 @@ func (p *Pipeline) Exec(ctx context.Context) ([]redis.Cmder, error) {
 
 // ExecChecked 执行管道中排队的全部命令，返回**整批**聚合错误：
 // `err == nil` 当且仅当没有任何命令失败，调用方无需再逐条检查 Cmder。
+//
+// 「整批全绿」是逐条回复的聚合判定，不是原子性承诺——管道非事务、逐条
+// 独立执行、失败不回滚已执行命令（redisx#248，详见类型 godoc「非事务语义」）。
 //
 // 与 Exec 的分工（redisx#214）：Exec 透传 go-redis 的首条错误口径，按
 // `err != nil` 判定会静默吞掉后续命令的失败；ExecChecked 聚合每条命令的
