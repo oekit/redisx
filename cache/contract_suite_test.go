@@ -1,8 +1,9 @@
 package cache
 
-// RedisCache 契约套件接入点：跑 github.com/oekit/pkg/cache/cachetest 的 8 个
+// RedisCache 契约套件接入点：跑 github.com/oekit/pkg/cache/cachetest 的 9 个
 // 通用场景（miss (nil,nil)、Set/Get 往返覆盖、显式 TTL 过期、Del/DelBatch
-// 幂等、GetOrLoad 回填计数、null marker 防穿透、Refresh、并发混合）。
+// 幂等、GetOrLoad 回填计数、null marker 防穿透、Refresh、并发混合、
+// nil_ctx_treated_as_background——nil ctx 按 Background 处理不 panic）。
 // 通用缓存语义由套件固化，本包不再重复编写。
 //
 // 本包为内部测试包（package cache）——cachetest import 的是 data/cache

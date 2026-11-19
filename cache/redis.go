@@ -8,6 +8,7 @@ import (
 
 	"github.com/oekit/logx"
 	"github.com/oekit/pkg/cache"
+	"github.com/oekit/pkg/contextx"
 	pkgerrors "github.com/oekit/pkg/errors"
 	"github.com/redis/go-redis/v9"
 )
@@ -107,6 +108,7 @@ func NewRedisCache[T any](client redis.UniversalClient, cfg RedisConfig[T]) *Red
 // 返回 (nil, nil) 表示数据不存在 — 包括 key 不存在和命中 null marker 两种情况。
 // 调用方需要 null marker 区分时使用 Exists 或 GetRaw。
 func (c *RedisCache[T]) Get(ctx context.Context, key string) (*T, error) {
+	ctx = contextx.OrBackground(ctx)
 	val, _, err := c.getInternal(ctx, key)
 	return val, err
 }
@@ -162,6 +164,7 @@ func (c *RedisCache[T]) getInternal(ctx context.Context, key string) (*T, bool, 
 // 命中 null marker 时直接返回 (nil, nil)，**不会**再调 Source，
 // 避免对不存在的 key 形成 thundering-herd 击穿。
 func (c *RedisCache[T]) GetOrLoad(ctx context.Context, key string) (*T, error) {
+	ctx = contextx.OrBackground(ctx)
 	// 1. 先查缓存
 	result, isNullMarker, err := c.getInternal(ctx, key)
 	if err != nil {
@@ -214,6 +217,7 @@ func (c *RedisCache[T]) GetOrLoad(ctx context.Context, key string) (*T, error) {
 
 // GetBytes 获取原始字节数据（不经过序列化）。
 func (c *RedisCache[T]) GetBytes(ctx context.Context, key string) ([]byte, error) {
+	ctx = contextx.OrBackground(ctx)
 	fullKey := c.fullKey(key)
 	data, err := c.client.Get(ctx, fullKey).Bytes()
 	if err != nil {
@@ -239,6 +243,7 @@ func (c *RedisCache[T]) GetBytes(ctx context.Context, key string) ([]byte, error
 // #113）：表达「数据不存在」请走 GetOrLoad 的 null marker（见 NullTTL），
 // 删除键请走 Del。
 func (c *RedisCache[T]) Set(ctx context.Context, key string, value *T) error {
+	ctx = contextx.OrBackground(ctx)
 	if value == nil {
 		return pkgerrors.New("cache Set: value 为 nil——序列化型后端未定义 nil 值编码，写 \"null\" 字节会被读路径还原成零值伪命中（#247）；表达「无值」请走 GetOrLoad 的 null marker，删除键请走 Del")
 	}
@@ -276,6 +281,7 @@ func (c *RedisCache[T]) effectiveTTL() time.Duration {
 // 序列化写 "null" 字节，Get 读回零值伪命中，且与 LocalCache 的 (nil, nil)
 // 口径跨后端分叉——自定义 TTL 的写入口不豁免该契约。
 func (c *RedisCache[T]) SetWithTTL(ctx context.Context, key string, value *T, ttl time.Duration) error {
+	ctx = contextx.OrBackground(ctx)
 	if ttl <= 0 {
 		return pkgerrors.Newf("cache SetWithTTL: ttl 必须 > 0（得到 %s）——0 会经 go-redis 写成永久键，与 Set 的 24h 缺省口径冲突（#113）", ttl)
 	}
@@ -304,6 +310,7 @@ func (c *RedisCache[T]) SetWithTTL(ctx context.Context, key string, value *T, tt
 // ttl 的入口对零值笔误（漏传时长/时长变量未初始化）一律响亮拒绝，不猜缺省
 // 也不写永久键。
 func (c *RedisCache[T]) SetRaw(ctx context.Context, key string, data []byte, ttl time.Duration) error {
+	ctx = contextx.OrBackground(ctx)
 	if ttl <= 0 {
 		return pkgerrors.Newf("cache SetRaw: ttl 必须 > 0（得到 %s）——0 会经 go-redis 写成永久键，与 Set 的 24h 缺省口径冲突（#113/#172）", ttl)
 	}
@@ -312,6 +319,7 @@ func (c *RedisCache[T]) SetRaw(ctx context.Context, key string, data []byte, ttl
 
 // Del 删除缓存。
 func (c *RedisCache[T]) Del(ctx context.Context, key string) error {
+	ctx = contextx.OrBackground(ctx)
 	return c.client.Del(ctx, c.fullKey(key)).Err()
 }
 
@@ -319,6 +327,7 @@ func (c *RedisCache[T]) Del(ctx context.Context, key string) error {
 // 空 keys 为幂等 no-op（不报错）——Redis DEL 要求至少 1 个 key，裸 DEL
 // 会报 wrong number of arguments，此处显式短路对齐 cachetest 契约。
 func (c *RedisCache[T]) DelBatch(ctx context.Context, keys ...string) error {
+	ctx = contextx.OrBackground(ctx)
 	if len(keys) == 0 {
 		return nil
 	}
@@ -336,6 +345,7 @@ func (c *RedisCache[T]) DelBatch(ctx context.Context, keys ...string) error {
 // 缺席键的消费方应回退 GetOrLoad——真 miss 回源回填，marker 命中在
 // 本实现的 GetOrLoad 内短路，两种情况都不会重复回源。
 func (c *RedisCache[T]) MGet(ctx context.Context, keys ...string) (map[string]*T, error) {
+	ctx = contextx.OrBackground(ctx)
 	if len(keys) == 0 {
 		return map[string]*T{}, nil
 	}
@@ -381,6 +391,7 @@ var _ cache.BatchGetter[string] = (*RedisCache[string])(nil)
 
 // Exists 检查缓存是否存在。
 func (c *RedisCache[T]) Exists(ctx context.Context, key string) (bool, error) {
+	ctx = contextx.OrBackground(ctx)
 	n, err := c.client.Exists(ctx, c.fullKey(key)).Result()
 	if err != nil {
 		return false, err
@@ -399,6 +410,7 @@ func (c *RedisCache[T]) Exists(ctx context.Context, key string) (bool, error) {
 // Del 失败直接上抛（redisx#215），不再只记日志：删除失败后 GetOrLoad 读到
 // 的是旧值，旧值冒充刷新结果返回同样是错误面断裂；中止即中止，调用方可重试。
 func (c *RedisCache[T]) Refresh(ctx context.Context, key string) (*T, error) {
+	ctx = contextx.OrBackground(ctx)
 	if c.cfg.Source == nil {
 		return nil, pkgerrors.New("cache Refresh: Source not configured")
 	}
