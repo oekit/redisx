@@ -187,7 +187,9 @@ func (c *RedisCache[T]) GetOrLoad(ctx context.Context, key string) (*T, error) {
 
 	// 3. 回填缓存
 	if source == nil {
-		// 缓存空值防穿透
+		// 缓存空值防穿透：直写 nullValue 哨兵（#247）——不经 c.Set 回填，
+		// Set 对 nil fail-fast 与此无联动；此处写的是精确哨兵字节而非
+		// "null" JSON，读路径按 null marker 识别（防穿透语义成立）。
 		if c.nullTTL > 0 {
 			if setErr := c.client.Set(ctx, c.fullKey(key), nullValue, c.nullTTL).Err(); setErr != nil {
 				c.log.Error("set null value error", "key", key, logx.ErrKey, setErr)
@@ -227,7 +229,19 @@ func (c *RedisCache[T]) GetBytes(ctx context.Context, key string) ([]byte, error
 }
 
 // Set 设置缓存。
+//
+// value == nil fail-fast（#247）：默认 JSON 序列化对 nil 指针产出字节 "null"，
+// 读路径不认得它——既非 nullValue 哨兵、json.Unmarshal("null", &result) 又是
+// 无错 no-op ⇒ Get 返回 &T{} **零值伪命中**；同操作的 LocalCache 则存 nil、
+// Get 返回 (nil, nil)，同一 cache.Cache[T] 接口跨后端语义分叉。cachetest
+// 契约（RunHitWithClock 前提）要求「序列化型实现须定义 nil 值的编码」——
+// 本实现显式拒绝、不猜语义（对齐 SetWithTTL 的 ttl<=0 fail-fast 护栏哲学，
+// #113）：表达「数据不存在」请走 GetOrLoad 的 null marker（见 NullTTL），
+// 删除键请走 Del。
 func (c *RedisCache[T]) Set(ctx context.Context, key string, value *T) error {
+	if value == nil {
+		return pkgerrors.New("cache Set: value 为 nil——序列化型后端未定义 nil 值编码，写 \"null\" 字节会被读路径还原成零值伪命中（#247）；表达「无值」请走 GetOrLoad 的 null marker，删除键请走 Del")
+	}
 	fullKey := c.fullKey(key)
 
 	data, err := c.cfg.Serializer(value)
@@ -257,9 +271,16 @@ func (c *RedisCache[T]) effectiveTTL() time.Duration {
 // 且经 twolevel.SetWithTTL 双层转发时 L1/L2 同时放大。对齐仓内护栏哲学
 // （distlock/ratelimit 对同类零值笔误 fail-fast）：显式自定义 TTL 却 <=0 视为
 // 调用方 bug，响亮拒绝，不猜缺省也不写永久键。
+//
+// value == nil 同样 fail-fast（#247，护栏与 Set 同口径）：nil 经默认 JSON
+// 序列化写 "null" 字节，Get 读回零值伪命中，且与 LocalCache 的 (nil, nil)
+// 口径跨后端分叉——自定义 TTL 的写入口不豁免该契约。
 func (c *RedisCache[T]) SetWithTTL(ctx context.Context, key string, value *T, ttl time.Duration) error {
 	if ttl <= 0 {
 		return pkgerrors.Newf("cache SetWithTTL: ttl 必须 > 0（得到 %s）——0 会经 go-redis 写成永久键，与 Set 的 24h 缺省口径冲突（#113）", ttl)
+	}
+	if value == nil {
+		return pkgerrors.New("cache SetWithTTL: value 为 nil——序列化型后端未定义 nil 值编码，写 \"null\" 字节会被读路径还原成零值伪命中（#247）；表达「无值」请走 GetOrLoad 的 null marker，删除键请走 Del")
 	}
 	fullKey := c.fullKey(key)
 
