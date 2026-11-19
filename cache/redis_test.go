@@ -1019,3 +1019,93 @@ func TestRedisCache_SetRaw_PositiveTTLHasExpiry(t *testing.T) {
 		t.Fatalf("positive TTL write must carry an expiry, got %s", ttl)
 	}
 }
+
+// TestRedisCache_Set_NilValueGuardAgainstNullPseudoHit 回归测试（#247）：
+// Set(nil) 必须 fail-fast 返回错误、绝不落键——旧实现经默认 JSON 序列化把
+// nil 指针写成字节 "null"，Get 读路径既不认 nullValue 哨兵、
+// json.Unmarshal("null", &result) 又是无错 no-op，返回 &T{} 零值伪命中；
+// 同操作的 LocalCache 返回 (nil, nil)，同一 cache.Cache[T] 接口跨后端分叉
+// （cachetest RunHitWithClock 前提：序列化型实现须定义 nil 值的编码）。
+func TestRedisCache_Set_NilValueGuardAgainstNullPseudoHit(t *testing.T) {
+	client, mr := newTestRedisClient(t)
+	rc := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "x:"})
+	ctx := context.Background()
+
+	err := rc.Set(ctx, "k", nil)
+	if err == nil {
+		t.Fatal("Set(nil) 必须返回错误（#247）")
+	}
+	if !strings.Contains(err.Error(), "nil") {
+		t.Fatalf("错误信息必须指明 value 为 nil，got: %v", err)
+	}
+	// 关键反断言：报错路径不得落键——旧实现落 "null" 字节键，被 Get 读成零值伪命中。
+	if mr.Exists("x:k") {
+		t.Fatal(`Set(nil) 报错后不得落键（旧实现写 "null" 字节，#247）`)
+	}
+}
+
+// TestRedisCache_SetWithTTL_NilValueGuard 回归测试（#247）：SetWithTTL 的
+// 自定义 TTL 入口不豁免 nil 值契约——与 Set 同口径 fail-fast，报错、绝不落键。
+func TestRedisCache_SetWithTTL_NilValueGuard(t *testing.T) {
+	client, mr := newTestRedisClient(t)
+	rc := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "x:"})
+	ctx := context.Background()
+
+	err := rc.SetWithTTL(ctx, "k", nil, time.Minute)
+	if err == nil {
+		t.Fatal("SetWithTTL(nil) 必须返回错误（#247）")
+	}
+	if !strings.Contains(err.Error(), "nil") {
+		t.Fatalf("错误信息必须指明 value 为 nil，got: %v", err)
+	}
+	if mr.Exists("x:k") {
+		t.Fatal("SetWithTTL(nil) 报错后不得落键（#247）")
+	}
+}
+
+// TestRedisCache_GetOrLoad_NilSource_WritesSentinelNotSet 钉住 GetOrLoad 对
+// nil Source 结果直写 nullValue 哨兵（#247）：不经 Set 回填（Set 对 nil
+// fail-fast，直通会炸），落库字节恰为哨兵；读侧按 null marker 口径返回
+// (nil, nil) 而非零值伪命中，且防穿透短路生效。
+func TestRedisCache_GetOrLoad_NilSource_WritesSentinelNotSet(t *testing.T) {
+	client, mr := newTestRedisClient(t)
+	var sourceCalls int
+	rc := NewRedisCache[testUser](client, RedisConfig[testUser]{
+		Prefix: "x:",
+		Source: func(ctx context.Context, key string) (*testUser, error) {
+			sourceCalls++
+			return nil, nil
+		},
+	})
+	ctx := context.Background()
+
+	got, err := rc.GetOrLoad(ctx, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("nil Source 结果必须返回 (nil, nil)，got %+v", got)
+	}
+	// 落库字节恰为 nullValue 哨兵（证明走的是哨兵直写而非 Set 的 JSON 序列化）。
+	raw, err := client.Get(ctx, "x:k").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw != nullValue {
+		t.Fatalf("GetOrLoad 对 nil Source 结果必须直写 nullValue 哨兵（#247），got %q", raw)
+	}
+	// 读侧口径：Get 返回 (nil, nil)，GetOrLoad 命中 marker 不再回源（防穿透）。
+	g, err := rc.Get(ctx, "k")
+	if err != nil || g != nil {
+		t.Fatalf("Get(null marker) 应返回 (nil, nil)，got (%+v, %v)", g, err)
+	}
+	if _, err := rc.GetOrLoad(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	if sourceCalls != 1 {
+		t.Fatalf("null marker 防穿透：Source 应只调 1 次，got %d", sourceCalls)
+	}
+	if !mr.Exists("x:k") {
+		t.Fatal("第二次 GetOrLoad 后 null marker 应仍在（防穿透短路，#247）")
+	}
+}
