@@ -1,3 +1,9 @@
+## [v0.16.6] — 2026-11-20
+
+- fix(cache): RedisCache Set/SetWithTTL 对 nil 值 fail-fast——默认序列化把 nil 写成 json "null"、读路径无错 no-op 还原零值伪命中，与 LocalCache 跨后端分叉且违 cachetest 契约「序列化型实现须定义 nil 编码」（#247）
+fix(cache): 全部 11 个公开入口补 nil-ctx 兜底——pkg v0.55.1 cachetest 契约第 9 场景在地板 bump CI 暴露 nil ctx 直捅 go-redis pool（#252）
+docs(pipeline): 补「非事务语义」立约段——go-redis Pipeline 非 MULTI/EXEC、无回滚，真原子走 Lua（timertask #150/#157 先例传导）（#248）
+
 ## [v0.16.5] — 2026-11-19
 
 - - refactor: ratelimit per-key 桶缓存两份逐字同构收敛——PeriodLimit.bucketFor 与 ResilientLimiter.localFor 下沉 bucketCache 单类型（sync.Map + build 闭包注入，含 once 单飞、nil 不缓存、清扫合一）；#166 时代修 singleflight 需双侧打补丁的漂移结构根除，既有 #125/#127/#166/#167 回归全绿（#242）
