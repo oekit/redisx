@@ -60,6 +60,10 @@ type RedisCache[T any] struct {
 	client  redis.UniversalClient
 	cfg     RedisConfig[T]
 	nullTTL time.Duration
+	// defaultJSON 标记 Serializer/Deserializer 均为内置 JSON 实现（构造期
+	// 未注入自定义编解码器）。读路径的历史 "null" 兼容（#258）只对内置
+	// 编解码启用：自定义编解码器的字节值域由调用方定义，不替它解释。
+	defaultJSON bool
 	// log 是 per-instance 日志（#120）：cfg.Logger 注入或缺省
 	// logx.Delegating("cache-redis")，构造期定死、运行期只读。
 	log logx.Logger
@@ -88,7 +92,10 @@ func NewRedisCache[T any](client redis.UniversalClient, cfg RedisConfig[T]) *Red
 		client:  client,
 		cfg:     cfg,
 		nullTTL: nullTTL,
-		log:     logx.Delegating("cache-redis"),
+		// 默认编解码判定必须在下方「缺省填充」之前（填充后无法区分用户
+		// 显式传 defaultSerializer 与未传）。
+		defaultJSON: cfg.Serializer == nil && cfg.Deserializer == nil,
+		log:         logx.Delegating("cache-redis"),
 	}
 	if cfg.Logger != nil {
 		c.log = cfg.Logger
@@ -116,6 +123,8 @@ func (c *RedisCache[T]) Get(ctx context.Context, key string) (*T, error) {
 // getInternal 内部方法，返回 (值, 是否命中 null marker, error)。
 // 命中 null marker 时返回 (nil, true, nil)；
 // key 不存在返回 (nil, false, nil)；
+// 命中旧版本 Set(key, nil) 写出的精确 "null" 时返回 (nil, false, nil)
+// （#258 升级兼容：按 miss 处理以便 GetOrLoad 回源覆盖自愈）；
 // 命中有效值返回 (&T, false, nil)；
 // 命中损坏条目（反序列化失败）同样返回 (nil, false, nil)——与空字节同口径
 // 按 miss 处理（#213），由 GetOrLoad 回源覆盖完成自愈。
@@ -141,6 +150,15 @@ func (c *RedisCache[T]) getInternal(ctx context.Context, key string) (*T, bool, 
 	}
 	if string(data) == nullValue {
 		return nil, true, nil
+	}
+	// 升级兼容（#258）：旧版本 Set(key, nil) 经内置 JSON 序列化写出精确
+	// "null" 字节；json.Unmarshal("null", &result) 是无错 no-op ⇒ 旧实现
+	// 把它还原成 &T{} 零值伪命中，GetOrLoad 见 result != nil 直接返回、
+	// 永不回源。按 **miss**（而非 null marker）处理：标记会短路 Source，
+	// 旧条目将永远无法自愈；miss 让 GetOrLoad 回源并覆盖，首次读即修复。
+	// 仅内置编解码启用（自定义字节值域不替调用方解释）。
+	if c.isLegacyJSONNull(data) {
+		return nil, false, nil
 	}
 
 	var result T
@@ -235,13 +253,12 @@ func (c *RedisCache[T]) GetBytes(ctx context.Context, key string) ([]byte, error
 // Set 设置缓存。
 //
 // value == nil fail-fast（#247）：默认 JSON 序列化对 nil 指针产出字节 "null"，
-// 读路径不认得它——既非 nullValue 哨兵、json.Unmarshal("null", &result) 又是
-// 无错 no-op ⇒ Get 返回 &T{} **零值伪命中**；同操作的 LocalCache 则存 nil、
-// Get 返回 (nil, nil)，同一 cache.Cache[T] 接口跨后端语义分叉。cachetest
-// 契约（RunHitWithClock 前提）要求「序列化型实现须定义 nil 值的编码」——
-// 本实现显式拒绝、不猜语义（对齐 SetWithTTL 的 ttl<=0 fail-fast 护栏哲学，
-// #113）：表达「数据不存在」请走 GetOrLoad 的 null marker（见 NullTTL），
-// 删除键请走 Del。
+// 旧读路径既不认 nullValue 哨兵、json.Unmarshal("null", &result) 又是无错
+// no-op ⇒ Get 返回 &T{} **零值伪命中**；同操作的 LocalCache 则存 nil、
+// Get 返回 (nil, nil)，同一 cache.Cache[T] 接口跨后端语义分叉。写侧继续
+// 拒绝：读侧虽已把存量 "null" 按 miss 自愈（#258），新写入仍不应制造
+// 「存了个值、读出来是 miss」的静默语义。表达「数据不存在」请走 GetOrLoad
+// 的 null marker（见 NullTTL），删除键请走 Del。
 func (c *RedisCache[T]) Set(ctx context.Context, key string, value *T) error {
 	ctx = contextx.OrBackground(ctx)
 	if value == nil {
@@ -370,6 +387,11 @@ func (c *RedisCache[T]) MGet(ctx context.Context, keys ...string) (map[string]*T
 		if s == nullValue {
 			continue // null marker 命中：缺席（消费方回退 GetOrLoad 享受短路）
 		}
+		// 升级兼容（#258，与 getInternal 同口径）：旧版本 Set(key, nil) 写出
+		// 的精确 "null" 按 miss 缺席，消费方回退 GetOrLoad 时回源覆盖自愈。
+		if c.isLegacyJSONNull([]byte(s)) {
+			continue
+		}
 		if len(s) == 0 {
 			continue // 损坏条目按 miss（与 getInternal 口径一致）
 		}
@@ -437,6 +459,17 @@ func (c *RedisCache[T]) fullKey(key string) string {
 // 历史：v0.4.0 前哨兵为 "__NULL__"，可被 SetRaw 合法写入精确碰撞（写入
 // 字面 "__NULL__" 即被永久误判为"数据不存在"），故改为 \x00 保留前缀。
 const nullValue = "\x00oekit:null"
+
+// legacyJSONNull 是历史版本 Set(key, nil) 经内置 JSON 序列化写出的精确
+// 字节串（#258 升级兼容的判定值）。
+const legacyJSONNull = "null"
+
+// isLegacyJSONNull 判定条目是否为旧版本写出的 "null" 伪值。仅在内置
+// Serializer/Deserializer 下启用（defaultJSON）；自定义编解码器自行定义
+// 字节语义，本实现不替它把 "null" 解释成 miss。
+func (c *RedisCache[T]) isLegacyJSONNull(data []byte) bool {
+	return c.defaultJSON && string(data) == legacyJSONNull
+}
 
 func defaultSerializer[T any](v *T) ([]byte, error) {
 	return json.Marshal(v)
