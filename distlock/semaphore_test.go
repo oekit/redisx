@@ -3,6 +3,7 @@ package distlock
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -275,5 +276,45 @@ func TestSemaphore_ValidationFailFast(t *testing.T) {
 	}
 	if _, err := NewSemaphore(c, "k", 1, time.Minute).Cleanup(ctx, 0); err != nil {
 		t.Errorf("valid Cleanup should pass validation, got %v", err)
+	}
+}
+
+// TestSemaphore_Cleanup_NegativeOlderThanFailsFast 回归 #257：olderThan<0
+// 会把 threshold 算到未来，ZREMRANGEBYSCORE -inf <未来> 删除全部槽位（含
+// 活跃持有者）——必须 fail-fast，且不得动任何槽位。
+func TestSemaphore_Cleanup_NegativeOlderThanFailsFast(t *testing.T) {
+	s, mr, _ := newTestSemaphore(t, "sem:cleanup-neg", 1, time.Minute)
+	ctx := context.Background()
+
+	if ok, err := s.Acquire(ctx, "a"); err != nil || !ok {
+		t.Fatalf("Acquire: ok=%v err=%v", ok, err)
+	}
+
+	n, err := s.Cleanup(ctx, -time.Second)
+	if err == nil {
+		t.Fatalf("Cleanup with negative olderThan must fail fast (#257), got n=%d nil error", n)
+	}
+	if !strings.Contains(err.Error(), "non-negative") {
+		t.Errorf("error must explain the non-negative requirement, got: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("failed Cleanup must report 0, got %d", n)
+	}
+
+	// 活跃槽位必须原样保留：max=1 时 b 仍拿不到配额。
+	if ok, err := s.Acquire(ctx, "b"); err != nil {
+		t.Fatalf("Acquire b: %v", err)
+	} else if ok {
+		t.Fatal("negative Cleanup must not delete live slots (#257)")
+	}
+	if members, err := mr.ZMembers("sem:cleanup-neg"); err != nil {
+		t.Fatalf("ZMembers: %v", err)
+	} else if len(members) != 1 || members[0] != "a" {
+		t.Fatalf("live slot a must survive failed Cleanup, got %v", members)
+	}
+
+	// olderThan=0 仍是合法口径（清理已过期槽），确保护栏只拦负值。
+	if n, err := s.Cleanup(ctx, 0); err != nil || n != 0 {
+		t.Errorf("Cleanup(0) on live slot should be a no-op, got n=%d err=%v", n, err)
 	}
 }

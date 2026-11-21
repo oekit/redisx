@@ -264,3 +264,97 @@ func TestLocker_StaleUnlockRace(t *testing.T) {
 	// 真正持有者解锁收尾
 	_ = l.Unlock(ctx, "race-key", "owner-B")
 }
+
+// --- #257：锁丢失/放弃续期回调与状态表清理 ---
+
+// TestAutoRenew_OnLockLostCallbackAndStateCleanup 端到端回归 #257：外部删除
+// 锁键（Redis 故障/逐出/他人接管）后，watchdog 必须（a）触发 WithOnLockLost
+// 回调且 key 为业务 key；（b）以 CompareAndDelete 把 l.locks 中的条目清掉，
+// 不再依赖永远不会再发生的 Unlock。
+func TestAutoRenew_OnLockLostCallbackAndStateCleanup(t *testing.T) {
+	mr := miniredis.RunT(t)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+
+	lost := make(chan string, 1)
+	l := NewRedisLocker(c,
+		WithAutoRenew(),
+		WithRenewInterval(10*time.Millisecond),
+		WithOnLockLost(func(key string) {
+			select {
+			case lost <- key:
+			default:
+			}
+		}),
+	)
+	ctx := context.Background()
+
+	if _, err := l.Lock(ctx, "lost-cb-key", time.Minute, time.Second); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	// 外部删除锁键：下一次续期得到 (false, nil) ⇒ onLost 分支。
+	if !mr.Del("lock:lost-cb-key") {
+		t.Fatal("expected lock key to be deleted from miniredis")
+	}
+
+	select {
+	case key := <-lost:
+		if key != "lost-cb-key" {
+			t.Fatalf("WithOnLockLost must receive the business key, got %q", key)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("WithOnLockLost must fire when renewal reports lock loss")
+	}
+
+	waitForCond(t, 3*time.Second, "l.locks entry must be cleaned when watchdog exits after lock loss (#257)", func() bool {
+		_, ok := l.locks.Load("lost-cb-key")
+		return !ok
+	})
+}
+
+// TestAutoRenew_OnLockLostCallback_GaveUp 端到端回归 #257：达到
+// WithMaxAutoRenew 上限主动放弃续期时同样触发 WithOnLockLost（锁将在 TTL
+// 后过期，调用方不得再假设自己持有），并清理 l.locks 条目。
+func TestAutoRenew_OnLockLostCallback_GaveUp(t *testing.T) {
+	mr := miniredis.RunT(t)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+
+	gaveUp := make(chan string, 1)
+	l := NewRedisLocker(c,
+		WithAutoRenew(),
+		WithRenewInterval(10*time.Millisecond),
+		WithMaxAutoRenew(60*time.Millisecond),
+		WithOnLockLost(func(key string) {
+			select {
+			case gaveUp <- key:
+			default:
+			}
+		}),
+	)
+	ctx := context.Background()
+
+	ownerID, err := l.Lock(ctx, "gaveup-cb-key", time.Minute, time.Second)
+	if err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+
+	select {
+	case key := <-gaveUp:
+		if key != "gaveup-cb-key" {
+			t.Fatalf("WithOnLockLost must receive the business key on gave-up, got %q", key)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("WithOnLockLost must fire when max auto-renew lifetime is reached")
+	}
+
+	waitForCond(t, 3*time.Second, "l.locks entry must be cleaned when watchdog exits after max lifetime (#257)", func() bool {
+		_, ok := l.locks.Load("gaveup-cb-key")
+		return !ok
+	})
+
+	// 收尾：锁仍在（尚未到 TTL），Unlock 正常删除；不得因状态已清而报错。
+	if err := l.Unlock(ctx, "gaveup-cb-key", ownerID); err != nil {
+		t.Fatalf("Unlock after gave-up: %v", err)
+	}
+}
