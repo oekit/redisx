@@ -1,3 +1,15 @@
+## [v0.16.7] — 2026-11-21
+
+- 第三轮设计/缺陷审计（2026-11-21）redisx 修复：
+
+- fix: distlock Unlock/Release 内部解耦取消 ctx（WithoutCancel+3s 有界）——已取消 ctx 下解锁不再失败致锁孤儿 5.5 分钟（#257）
+- fix: watchdog onLost/onGaveUp 退出时 CompareAndDelete 清理 lockState——高基数锁键不再永久残留 map（#257）
+- feat: WithOnLockLost / WithSemaphoreOnLockLost 回调——丢锁/放弃续期可编程感知（#257）
+- fix: Semaphore Cleanup olderThan<0 fail-fast——负 grace 不再清空全部活跃槽位（#257）
+- fix: cache 读路径把精确 "null" 视为 miss——滚动升级后旧版本写下的 nil 缓存不再零值伪命中（#258）
+
+关联问题单：redisx#257、redisx#258。
+
 ## [v0.16.6] — 2026-11-20
 
 - fix(cache): RedisCache Set/SetWithTTL 对 nil 值 fail-fast——默认序列化把 nil 写成 json "null"、读路径无错 no-op 还原零值伪命中，与 LocalCache 跨后端分叉且违 cachetest 契约「序列化型实现须定义 nil 编码」（#247）
