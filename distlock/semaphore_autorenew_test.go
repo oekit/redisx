@@ -221,3 +221,86 @@ func TestSemaphore_AutoRenew_Options(t *testing.T) {
 		t.Errorf("negative maxAutoRenew must be preserved (unlimited), got %v", unlimited.maxAutoRenew)
 	}
 }
+
+// --- #257：槽位丢失/放弃续期回调与状态表清理 ---
+
+// TestSemaphore_AutoRenew_OnSlotLostCallbackAndStateCleanup 端到端回归
+// #257：外部回收槽位后，WithSemaphoreOnLockLost 必须收到 identifier，
+// 且 sessions 条目在 watchdog 退出时被 CompareAndDelete 清掉。
+func TestSemaphore_AutoRenew_OnSlotLostCallbackAndStateCleanup(t *testing.T) {
+	lost := make(chan string, 1)
+	mr := miniredis.RunT(t)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	s := NewSemaphore(c, "sem:ar-lost-cb", 1, time.Minute,
+		WithSemaphoreAutoRenew(),
+		WithSemaphoreRenewInterval(10*time.Millisecond),
+		WithSemaphoreOnLockLost(func(id string) {
+			select {
+			case lost <- id:
+			default:
+			}
+		}),
+	)
+	ctx := context.Background()
+
+	if ok, err := s.Acquire(ctx, "a"); err != nil || !ok {
+		t.Fatalf("Acquire: ok=%v err=%v", ok, err)
+	}
+	if err := s.client.Del(ctx, s.key).Err(); err != nil {
+		t.Fatalf("del zset: %v", err)
+	}
+
+	select {
+	case id := <-lost:
+		if id != "a" {
+			t.Fatalf("WithSemaphoreOnLockLost must receive the identifier, got %q", id)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("WithSemaphoreOnLockLost must fire when renew reports slot loss")
+	}
+
+	waitForCond(t, 3*time.Second, "s.sessions entry must be cleaned when watchdog exits after slot loss (#257)", func() bool {
+		_, ok := s.sessions.Load("a")
+		return !ok
+	})
+}
+
+// TestSemaphore_AutoRenew_OnSlotLostCallback_GaveUp 端到端回归 #257：达到
+// WithSemaphoreMaxAutoRenew 上限放弃续期时同样触发回调并清理 sessions。
+func TestSemaphore_AutoRenew_OnSlotLostCallback_GaveUp(t *testing.T) {
+	gaveUp := make(chan string, 1)
+	mr := miniredis.RunT(t)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	s := NewSemaphore(c, "sem:ar-gaveup-cb", 1, time.Minute,
+		WithSemaphoreAutoRenew(),
+		WithSemaphoreRenewInterval(10*time.Millisecond),
+		WithSemaphoreMaxAutoRenew(60*time.Millisecond),
+		WithSemaphoreOnLockLost(func(id string) {
+			select {
+			case gaveUp <- id:
+			default:
+			}
+		}),
+	)
+	ctx := context.Background()
+
+	if ok, err := s.Acquire(ctx, "a"); err != nil || !ok {
+		t.Fatalf("Acquire: ok=%v err=%v", ok, err)
+	}
+
+	select {
+	case id := <-gaveUp:
+		if id != "a" {
+			t.Fatalf("WithSemaphoreOnLockLost must receive the identifier on gave-up, got %q", id)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("WithSemaphoreOnLockLost must fire when max auto-renew lifetime is reached")
+	}
+
+	waitForCond(t, 3*time.Second, "s.sessions entry must be cleaned when watchdog exits after max lifetime (#257)", func() bool {
+		_, ok := s.sessions.Load("a")
+		return !ok
+	})
+}

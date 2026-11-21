@@ -49,6 +49,16 @@ var unlockScript = redis.NewScript(`
 	end
 `)
 
+// releaseTimeout 是 Unlock/Release 内部 Redis 调用的硬上界（#257）。
+//
+// 口径对齐 pkg/distlock.ReleaseUncancelable（withlock.go:74-105）：
+// context.WithoutCancel 只剥离调用方的取消信号 **和 deadline**，裸
+// WithoutCancel 的解锁在网络半开/慢盘时会永久挂起；叠加本超时补回上界。
+// 解锁超时按通信故障路径返回（watchdog 不停、状态保留、可重试），与
+// ReleaseUncancelable 「释放失败只记日志、租约/TTL 兜底」同一口径。
+// 包内 var 而非 const：测试可注入更短上界。
+var releaseTimeout = 3 * time.Second
+
 // renewScript Lua 续期脚本（原子 check-and-renew）。
 // 用 PEXPIRE 毫秒精度：SETEX秒级精度对 sub-second TTL 会截断为 0，
 // EXPIRE 0 在 Redis 里等价于立即删除。
@@ -76,6 +86,10 @@ type RedisLocker struct {
 	retryInterval       time.Duration
 	onLock              func(key string, acquired bool, err error)
 	onUnlock            func(key string, err error)
+	// onLockLost 是自动续期丢失锁/放弃续期的回调（#257，WithOnLockLost）：
+	// 在 watchdog goroutine 内同步触发，应用可据此取消长临界区工作或把
+	// 健康检查转 red——丢锁后继续执行会与新持有者并发（静默脑裂）。
+	onLockLost func(key string)
 	// log 是 per-instance 日志（#120）：构造期经 WithLogger 注入，缺省为
 	// 本实例私有的 logx.Delegating("distlock")（与既有包级缺省行为一致——
 	// 仍是懒解析全局 Default，宿主未 SetDefault 时落 stderr；区别是组件名
@@ -148,6 +162,25 @@ func WithOnLock(fn func(key string, acquired bool, err error)) RedisLockerOption
 // 用于日志记录和监控。
 func WithOnUnlock(fn func(key string, err error)) RedisLockerOption {
 	return func(l *RedisLocker) { l.onUnlock = fn }
+}
+
+// WithOnLockLost 设置锁丢失回调（#257）：仅在启用 WithAutoRenew 时生效。
+//
+// 触发时机（两者均意味着「本实例已不能保证持有锁」）：
+//   - 续期返回 (false, nil)：锁已过期易主/被删除（onLost）；
+//   - 达到 WithMaxAutoRenew 最大生命周期主动放弃续期（onGaveUp）——锁会在
+//     TTL 后自然过期，调用方同样不得再假设自己持有锁。
+//
+// key 为业务锁 key（不含 WithPrefix 前缀）。回调在 watchdog goroutine 内
+// **同步**执行，必须快速返回且不得阻塞——长耗时逻辑请自行转投递
+// （如 send 到 buffered channel）；回调 panic 由 async.GoSafe recover，
+// 但不应依赖该兜底。用途：长临界区中途丢锁的静默脑裂防护（取消工作、
+// 健康检查转 red、记录审计事件）。
+//
+// 回调不区分两种触发原因；需要区分时可结合 WithMaxAutoRenew 的配置时长
+// 与自身计时判断。
+func WithOnLockLost(fn func(key string)) RedisLockerOption {
+	return func(l *RedisLocker) { l.onLockLost = fn }
 }
 
 // WithAutoRenew 启用自动续期。
@@ -295,7 +328,16 @@ func (l *RedisLocker) Unlock(ctx context.Context, key string, ownerID string) er
 	}
 
 	// 删锁先行（#115）：拿到脚本结果前不碰 watchdog 状态。
-	result, err := unlockScript.Run(ctx, l.client, []string{l.lockKey(key)}, ownerID).Int()
+	//
+	// ctx 解耦（#257，口径对齐 pkg/distlock.ReleaseUncancelable）：调用方
+	// ctx 已取消/已过期时仍必须把 DEL 发出去——`defer cancel();
+	// defer lock.Unlock(ctx)` 的常见写法下，直接透传会让 go-redis 在发包前
+	// 返回 context.Canceled、脚本不执行，锁孤儿到 TTL 过期（ttl=30s 时
+	// watchdog 还会继续续期到 10×ttl）。WithoutCancel 剥掉取消信号，保留
+	// ctx 取值；releaseTimeout 补回硬上界，避免解锁永久挂起。
+	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+	result, err := unlockScript.Run(uctx, l.client, []string{l.lockKey(key)}, ownerID).Int()
 	if err != nil {
 		// 通信故障：锁可能仍在，watchdog 不停（继续续期兜底），状态原样保留。
 		werr := pkgerrors.Wrapf(err, "redis unlock failed")
@@ -481,9 +523,15 @@ func (l *RedisLocker) startAutoRenew(_ context.Context, key string, ownerID stri
 	}
 	w.onLost = func() {
 		l.logr().Warn("auto renew failed: lock lost or not owned", "key", key)
+		if l.onLockLost != nil {
+			l.onLockLost(key)
+		}
 	}
 	w.onGaveUp = func(maxLifetime time.Duration) {
 		l.logr().Warn("auto renew exceeded max lifetime, giving up lock", "key", key, "max_lifetime", maxLifetime)
+		if l.onLockLost != nil {
+			l.onLockLost(key)
+		}
 	}
 	w.startAutoRenew()
 }
