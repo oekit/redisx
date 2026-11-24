@@ -3,6 +3,8 @@ package distlock
 import (
 	"context"
 	"errors"
+	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -310,5 +312,260 @@ func TestBruteForceGuard_ValidationFailFast(t *testing.T) {
 	g := NewBruteForceGuard(c, GuardConfig{MaxFails: 3, Window: time.Minute, LockTTL: time.Minute})
 	if _, err := g.Fail(ctx, ""); err == nil {
 		t.Error("empty key must fail fast")
+	}
+}
+
+// waitSteadyNumGoroutine 等待进程 goroutine 总数进入稳态并返回该值：连续
+// steadySamples 次采样同值即认为稳定（goroutine 出生/退出是异步的；降级层
+// 构建与 Close 释放均在毫秒级完成，CI 满载下可能显著变慢——窗口放宽到
+// 15s，沿袭轮询窗口 3s→15s 的教训；超时返回末次采样值交调用方断言报错）。
+func waitSteadyNumGoroutine(t *testing.T) int {
+	t.Helper()
+	const (
+		steadySamples = 3
+		interval      = 100 * time.Millisecond
+		window        = 15 * time.Second
+	)
+	last := runtime.NumGoroutine()
+	streak := 1
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		time.Sleep(interval)
+		if cur := runtime.NumGoroutine(); cur == last {
+			streak++
+			if streak >= steadySamples {
+				return cur
+			}
+		} else {
+			last = cur
+			streak = 1
+		}
+	}
+	return last
+}
+
+// TestBruteForceGuard_CloseIdempotentWithoutFallback 回归（redisx#221 验收②）：
+// 未触发过降级（mem 未构建）时 Close 为 no-op，可安全重复调用；Close 后
+// Fail/Check/Reset 明确返回 ErrGuardClosed（关后复用不静默）。
+func TestBruteForceGuard_CloseIdempotentWithoutFallback(t *testing.T) {
+	g, _ := newGuardTest(t, true)
+	ctx := context.Background()
+
+	if err := g.Close(ctx); err != nil {
+		t.Fatalf("Close without fallback: %v", err)
+	}
+	if err := g.Close(ctx); err != nil {
+		t.Fatalf("second Close must be idempotent: %v", err)
+	}
+	if _, err := g.Fail(ctx, "user:42"); !errors.Is(err, ErrGuardClosed) {
+		t.Errorf("Fail after Close = %v, want ErrGuardClosed", err)
+	}
+	if _, _, err := g.Check(ctx, "user:42"); !errors.Is(err, ErrGuardClosed) {
+		t.Errorf("Check after Close = %v, want ErrGuardClosed", err)
+	}
+	if err := g.Reset(ctx, "user:42"); !errors.Is(err, ErrGuardClosed) {
+		t.Errorf("Reset after Close = %v, want ErrGuardClosed", err)
+	}
+}
+
+// TestBruteForceGuard_CloseStopsFallbackCleanup 回归（redisx#221 验收①）：
+// 构造 → 触发一次降级（miniredis 关闭，惰性构建进程内 Lockout）→ Close →
+// 进程 goroutine 足迹回到降级前稳态（清扫 goroutine 无泄漏）；重复 Close
+// 幂等；Close 后即便 Redis 仍故障也不得再懒构建降级层（无新 goroutine）。
+//
+// 断言用 runtime.NumGoroutine 稳态对比而非清扫 goroutine 栈帧计数：帧名
+// 探针耦合 concurrency 内部实现，v0.39.1（concurrency#363）把清扫循环收编
+// 进 keyedTTLRegistry 后，栈帧从 ratelimit.(*LockoutOf[...]).cleanup 变为
+// ratelimit.(*keyedTTLRegistry[...]).cleanup，探针恒为 0（#238 CI 实测
+// 16.74s 误报泄漏）。收编前后生命周期语义一致（构造即启动、Close 即停、
+// 幂等），稳态足迹对比对任一实现形态都成立且零内部耦合。
+func TestBruteForceGuard_CloseStopsFallbackCleanup(t *testing.T) {
+	ctx := context.Background()
+
+	g, mr := newGuardTest(t, true)
+
+	// 基线在 miniredis 关停后采样：服务端 goroutine 的退出噪声先沉降，
+	// 后续每个稳态点只反映降级层的生命周期。
+	mr.Close() // Redis 故障：触发降级路径
+	baseline := waitSteadyNumGoroutine(t)
+
+	if _, err := g.Fail(ctx, "user:42"); err != nil {
+		t.Fatalf("degraded fail: %v", err)
+	}
+	// 正向对照：惰性构建恰好带来一个后台清扫 goroutine——保证后续
+	// 「Close 回到基线」不是空洞通过（降级层确实持有可泄漏面）。
+	if got := waitSteadyNumGoroutine(t); got != baseline+1 {
+		t.Fatalf("goroutines after fallback build = %d, want baseline+1 = %d", got, baseline+1)
+	}
+
+	if err := g.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := g.Close(ctx); err != nil {
+		t.Fatalf("second Close must be idempotent: %v", err)
+	}
+	// 清扫 goroutine 已释放：足迹回落基线（不泄漏）。
+	if got := waitSteadyNumGoroutine(t); got != baseline {
+		t.Fatalf("goroutines after Close = %d, want baseline %d (goroutine leak)", got, baseline)
+	}
+
+	// Close 后 Redis 仍故障：调用明确报错，且不得再构建降级层。
+	if _, err := g.Fail(ctx, "user:42"); !errors.Is(err, ErrGuardClosed) {
+		t.Fatalf("Fail after Close = %v, want ErrGuardClosed", err)
+	}
+	if _, _, err := g.Check(ctx, "user:42"); !errors.Is(err, ErrGuardClosed) {
+		t.Fatalf("Check after Close = %v, want ErrGuardClosed", err)
+	}
+	if err := g.Reset(ctx, "user:42"); !errors.Is(err, ErrGuardClosed) {
+		t.Fatalf("Reset after Close = %v, want ErrGuardClosed", err)
+	}
+	// memFor 直验构建门：关后连降级层的懒构建入口都已封死。
+	if _, err := g.memFor(); !errors.Is(err, ErrGuardClosed) {
+		t.Fatalf("memFor after Close = %v, want ErrGuardClosed", err)
+	}
+	if got := waitSteadyNumGoroutine(t); got != baseline {
+		t.Fatalf("goroutines after closed reuse = %d, want baseline %d (no new cleanup goroutine)", got, baseline)
+	}
+}
+
+// TestBruteForceGuard_FailWithResultTransition 回归（redisx#222 验收①②）：
+// 到阈值那次 NewlyLocked=true；锁定期内继续 Fail 为 Locked=true /
+// NewlyLocked=false；Count/Remain 一次返回（429 文案不再二次 Check）；
+// 旧 Fail 的锁定态语义不变。
+func TestBruteForceGuard_FailWithResultTransition(t *testing.T) {
+	g, _ := newGuardTest(t, false) // 阈值 3 / 窗口 10m / 锁定 30m
+	ctx := context.Background()
+
+	for i := int64(1); i <= 2; i++ {
+		res, err := g.FailWithResult(ctx, "user:42")
+		if err != nil {
+			t.Fatalf("fail %d: %v", i, err)
+		}
+		if res.Locked || res.NewlyLocked || res.Remain != 0 || res.Count != i {
+			t.Fatalf("fail %d = %+v, want unlocked/not-newly/count=%d", i, res, i)
+		}
+	}
+
+	res, err := g.FailWithResult(ctx, "user:42")
+	if err != nil {
+		t.Fatalf("trip fail: %v", err)
+	}
+	if !res.Locked || !res.NewlyLocked || res.Count != 3 {
+		t.Fatalf("trip result = %+v, want locked+newly+count=3", res)
+	}
+	if res.Remain <= 29*time.Minute || res.Remain > 30*time.Minute {
+		t.Fatalf("trip remain = %v, want ~30m", res.Remain)
+	}
+
+	res, err = g.FailWithResult(ctx, "user:42")
+	if err != nil {
+		t.Fatalf("locked fail: %v", err)
+	}
+	if !res.Locked || res.NewlyLocked {
+		t.Fatalf("locked-period result = %+v, want locked but not newly", res)
+	}
+	if res.Count != 4 || res.Remain <= 0 || res.Remain > 30*time.Minute {
+		t.Fatalf("locked-period count/remain = %d/%v, want 4/(0,30m]", res.Count, res.Remain)
+	}
+
+	// 旧 Fail 签名行为不变：仍返回锁定态。
+	locked, err := g.Fail(ctx, "user:42")
+	if err != nil || !locked {
+		t.Fatalf("legacy Fail = (%v, %v), want (true, nil)", locked, err)
+	}
+}
+
+// TestBruteForceGuard_FailWithResultConcurrentSingleTransition 回归
+// （redisx#222 验收②）：并发 N 个请求同时跨过阈值，Lua `SET NX` 的原子性
+// 保证恰好一个 NewlyLocked=true（Check+Fail 双往返的 TOCTOU 重复告警面
+// 在单次 FailWithResult 内不存在）。
+func TestBruteForceGuard_FailWithResultConcurrentSingleTransition(t *testing.T) {
+	mr := miniredis.RunT(t)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	g := NewBruteForceGuard(c, GuardConfig{
+		MaxFails: 5,
+		Window:   time.Minute,
+		LockTTL:  time.Minute,
+	})
+	ctx := context.Background()
+
+	const preFails = 4 // 差一次到阈值
+	for i := 0; i < preFails; i++ {
+		if _, err := g.Fail(ctx, "user:42"); err != nil {
+			t.Fatalf("pre-seed fail %d: %v", i, err)
+		}
+	}
+
+	const racers = 16
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	newly, lockedCount, errCount := 0, 0, 0
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			res, err := g.FailWithResult(ctx, "user:42")
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errCount++
+				return
+			}
+			if res.NewlyLocked {
+				newly++
+			}
+			if res.Locked {
+				lockedCount++
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if errCount != 0 {
+		t.Fatalf("%d concurrent FailWithResult calls failed", errCount)
+	}
+	if newly != 1 {
+		t.Fatalf("NewlyLocked count = %d, want exactly 1 across concurrent threshold crossing", newly)
+	}
+	if lockedCount != racers {
+		t.Fatalf("Locked count = %d, want %d (all post-threshold failures report locked)", lockedCount, racers)
+	}
+}
+
+// TestBruteForceGuard_FailWithResultMemFallback 降级路径的 FailWithResult：
+// Count 恒 0（进程内实现不暴露计数）、锁定跃迁仍可区分（新触发返回完整
+// LockTTL，锁定期内返回递减余量）、Remain 可用。
+func TestBruteForceGuard_FailWithResultMemFallback(t *testing.T) {
+	g, mr := newGuardTest(t, true)
+	ctx := context.Background()
+	t.Cleanup(func() { _ = g.Close(ctx) })
+
+	mr.Close() // Redis 故障：走进程内降级层
+	for i := 0; i < 2; i++ {
+		res, err := g.FailWithResult(ctx, "user:42")
+		if err != nil {
+			t.Fatalf("degraded fail %d: %v", i, err)
+		}
+		if res.Locked || res.NewlyLocked || res.Count != 0 {
+			t.Fatalf("degraded fail %d = %+v, want unlocked/not-newly/count=0", i, res)
+		}
+	}
+	res, err := g.FailWithResult(ctx, "user:42")
+	if err != nil {
+		t.Fatalf("degraded trip fail: %v", err)
+	}
+	if !res.Locked || !res.NewlyLocked || res.Remain != 30*time.Minute {
+		t.Fatalf("degraded trip result = %+v, want locked+newly+full 30m", res)
+	}
+	res, err = g.FailWithResult(ctx, "user:42")
+	if err != nil {
+		t.Fatalf("degraded locked fail: %v", err)
+	}
+	if !res.Locked || res.NewlyLocked || res.Remain <= 0 || res.Remain >= 30*time.Minute {
+		t.Fatalf("degraded locked-period result = %+v, want locked/not-newly/decreasing remain", res)
 	}
 }

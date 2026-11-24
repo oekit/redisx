@@ -33,7 +33,7 @@ type renewWatchdog struct {
 	// 调用方 ctx 取消不中断续期。
 	renewCtx context.Context
 	// interval 续期间隔（[renewIntervalFrom] 推导）；maxLifetime 续期最大
-	// 生命周期（[renewMaxLifetime] 三态，0 = 无 deadline）。
+	// 生命周期（pkg/distlock.MaxLifetime 三态，0 = 无 deadline）。
 	interval    time.Duration
 	maxLifetime time.Duration
 	// renew 单次续期：true = 成功；false = 锁/槽已丢失（watchdog 必须退出，
@@ -45,6 +45,13 @@ type renewWatchdog struct {
 	onRetryErr func(err error)
 	onLost     func()
 	onGaveUp   func(maxLifetime time.Duration)
+	// cleanup 在 goroutine 因锁/槽丢失或达 maxLifetime 退出时调用，供所属
+	// 类型从状态表 CompareAndDelete 本次 state（#257）。此前清理只发生在
+	// Unlock/Release 路径：Redis 故障/逐出后 watchdog 自行退出，sync.Map
+	// 条目永久残留——高基数锁键下形成无界泄漏。CompareAndDelete 以指针
+	// 身份校验，窗口期新持有者换入的 state 不会被误删。可为 nil（单测
+	// 直接构造 watchdog 时）。
+	cleanup func()
 }
 
 // newRenewWatchdog 创建续期 watchdog 并把新状态原子换入 m。mapKey 是状态表的
@@ -63,7 +70,14 @@ func newRenewWatchdog(m *sync.Map, mapKey, ownerID string) *renewWatchdog {
 			stopState(prev)
 		}
 	}
-	return &renewWatchdog{state: st, renewCtx: renewCtx}
+	return &renewWatchdog{
+		state:    st,
+		renewCtx: renewCtx,
+		// 身份校验清理（#257）：只删「本 state 仍是 map 当前值」的条目。
+		// 若窗口期内新持有者已换入新 state（Acquire 成功/幂等刷新），
+		// CompareAndDelete 返回 false 原样保留，不会误杀新续期。
+		cleanup: func() { m.CompareAndDelete(mapKey, st) },
+	}
 }
 
 // startAutoRenew 启动续期 goroutine。方法名刻意保持 startAutoRenew：#33 回归
@@ -98,6 +112,7 @@ func (w *renewWatchdog) startAutoRenew() {
 			case <-lifetimeC:
 				// 达到最大续期生命周期：放弃续期，锁/槽在 TTL/slotTTL 后自然
 				// 过期回收。这是忘记 Unlock/Release 时的安全网（默认 10×ttl）。
+				w.cleanupState()
 				w.onGaveUp(w.maxLifetime)
 				return
 			case <-ticker.C:
@@ -111,12 +126,24 @@ func (w *renewWatchdog) startAutoRenew() {
 				if !ok {
 					// 锁/槽已丢失（易主/过期回收/被接管）：显式告警后退出。
 					// 继续续期会与新持有者并发（静默脑裂形态）。
+					// 退出前 CompareAndDelete 清理状态表（#257），否则该条目
+					// 只能等 Unlock/Release 清理——而丢锁场景通常不会再有
+					// 一次成功的 Unlock ⇒ 永久残留。
+					w.cleanupState()
 					w.onLost()
 					return
 				}
 			}
 		}
 	})
+}
+
+// cleanupState 调用所属类型的身份校验清理（#257）；未注入时 no-op（单测
+// 直接构造 renewWatchdog 的既有形态不需要状态表）。
+func (w *renewWatchdog) cleanupState() {
+	if w.cleanup != nil {
+		w.cleanup()
+	}
 }
 
 // stopState 停掉一个续期状态（幂等，once 保护）：取消 derived context 并
@@ -150,17 +177,7 @@ func renewIntervalFrom(configured, ttl time.Duration) time.Duration {
 	return interval
 }
 
-// renewMaxLifetime 计算续期最大生命周期（#159 单源，三态）：
-// 0（未设置）= 10×ttl；负值 = 不限制（返回 0 表示无 deadline）；正值 = 显式
-// 上限。忘 Unlock/Release 时续期到期自行退出，锁/槽在 TTL 后自然过期回收
-// ——不形成永久持锁 + goroutine 泄漏（TTL 安全网重新生效）。
-func renewMaxLifetime(configured, ttl time.Duration) time.Duration {
-	switch {
-	case configured == 0:
-		return 10 * ttl
-	case configured < 0:
-		return 0
-	default:
-		return configured
-	}
-}
+// renewMaxLifetime 的三态逻辑（#159：0（未设置）= 10×ttl；负值 = 不限制
+// （返回 0 表示无 deadline）；正值 = 显式上限）已随 #534 收敛进
+// pkg/distlock.MaxLifetime——单源:pkg/distlock.MaxLifetime。
+// 调用点：RedisLocker.startAutoRenew 与 Semaphore.startAutoRenew。

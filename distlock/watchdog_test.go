@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	pkgdistlock "github.com/oekit/pkg/distlock"
 )
 
 // --- #159：watchdog 状态机单源后的共享行为钉 ---
@@ -54,6 +56,9 @@ func TestRenewIntervalFrom(t *testing.T) {
 	}
 }
 
+// TestRenewMaxLifetime 三态语义已单源进 pkg/distlock.MaxLifetime（本仓本地
+// 实现删除）；用例保留为消费侧契约钉——pkg 实现若与 redisx 历史口径漂移
+// （0→10×ttl、负→0 表不限、正→显式），本测试即红。
 func TestRenewMaxLifetime(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -67,8 +72,8 @@ func TestRenewMaxLifetime(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := renewMaxLifetime(tc.configured, tc.ttl); got != tc.want {
-				t.Fatalf("renewMaxLifetime(%v, %v) = %v, want %v", tc.configured, tc.ttl, got, tc.want)
+			if got := pkgdistlock.MaxLifetime(tc.configured, tc.ttl); got != tc.want {
+				t.Fatalf("MaxLifetime(%v, %v) = %v, want %v", tc.configured, tc.ttl, got, tc.want)
 			}
 		})
 	}
@@ -221,5 +226,93 @@ func TestNewRenewWatchdog_SwapStopsPreviousState(t *testing.T) {
 	}
 	if _, ok := m.Load("ident"); !ok {
 		t.Fatal("new state must be present in the map")
+	}
+}
+
+// TestRenewWatchdog_LostCleansUpState 回归 #257：锁/槽丢失导致 watchdog
+// 退出时，状态表条目必须被删除——清理此前只在 Unlock/Release 路径，丢锁
+// 场景通常不会再有成功 Unlock ⇒ 高基数锁键下 sync.Map 无界泄漏。
+func TestRenewWatchdog_LostCleansUpState(t *testing.T) {
+	var m sync.Map
+	lost := make(chan struct{}, 1)
+	w := newRenewWatchdog(&m, "leak-key", "owner")
+	w.interval = 5 * time.Millisecond
+	w.renew = func(context.Context) (bool, error) { return false, nil }
+	w.onRetryErr = func(error) {}
+	w.onLost = func() {
+		select {
+		case lost <- struct{}{}:
+		default:
+		}
+	}
+	w.onGaveUp = func(time.Duration) { t.Error("onGaveUp must not fire without maxLifetime") }
+	w.startAutoRenew()
+
+	select {
+	case <-lost:
+	case <-time.After(3 * time.Second):
+		t.Fatal("onLost must fire when renew reports (false, nil)")
+	}
+	if _, ok := m.Load("leak-key"); ok {
+		t.Fatal("state entry must be removed when the watchdog exits after lock loss (#257)")
+	}
+}
+
+// TestRenewWatchdog_GaveUpCleansUpState 回归 #257：达到 maxLifetime 放弃
+// 续期退出时同样清理状态表（安全网触发后不会再有 Unlock 清理）。
+func TestRenewWatchdog_GaveUpCleansUpState(t *testing.T) {
+	var m sync.Map
+	gaveUp := make(chan struct{}, 1)
+	w := newRenewWatchdog(&m, "gaveup-key", "owner")
+	w.interval = 5 * time.Millisecond
+	w.maxLifetime = 50 * time.Millisecond
+	w.renew = func(context.Context) (bool, error) { return true, nil }
+	w.onRetryErr = func(error) {}
+	w.onLost = func() { t.Error("onLost must not fire while renewal succeeds") }
+	w.onGaveUp = func(time.Duration) {
+		select {
+		case gaveUp <- struct{}{}:
+		default:
+		}
+	}
+	w.startAutoRenew()
+
+	select {
+	case <-gaveUp:
+	case <-time.After(3 * time.Second):
+		t.Fatal("onGaveUp must fire at maxLifetime")
+	}
+	if _, ok := m.Load("gaveup-key"); ok {
+		t.Fatal("state entry must be removed when the watchdog exits after max lifetime (#257)")
+	}
+}
+
+// TestRenewWatchdog_CleanupKeepsReplacedState 身份校验（#257）：清理只删
+// 「本 state 仍是 map 当前值」的条目；窗口期内新持有者已换入新 state 时，
+// CompareAndDelete 必须失败，绝不误删新续期。
+func TestRenewWatchdog_CleanupKeepsReplacedState(t *testing.T) {
+	var m sync.Map
+	w := newRenewWatchdog(&m, "raced-key", "old-owner")
+
+	newState := &lockState{ownerID: "new-owner", stopChan: make(chan struct{})}
+	m.Store("raced-key", newState)
+
+	w.cleanupState()
+
+	got, ok := m.Load("raced-key")
+	if !ok {
+		t.Fatal("cleanup must not delete a state installed by a newer holder (#257 identity check)")
+	}
+	if got.(*lockState) != newState {
+		t.Fatal("cleanup must leave the newer holder's state untouched")
+	}
+	select {
+	case <-newState.stopChan:
+		t.Fatal("cleanup must not stop the newer holder's renewal")
+	default:
+	}
+	w.cleanupState() // 幂等：仍不误删
+	if got, ok := m.Load("raced-key"); !ok || got.(*lockState) != newState {
+		t.Fatal("repeated cleanup must keep the newer holder's state")
 	}
 }

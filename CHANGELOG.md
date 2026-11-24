@@ -1,3 +1,55 @@
+## [v0.16.8] — 2026-11-23
+
+- build: 依赖地板对齐（矩阵地板波次）——新地板：github.com/oekit/pkg v0.60.0 。零行为变化；已发布产物的 go.mod 地板此前滞后于矩阵登记版本，本版把新地板焊进已发布产物。
+
+## [v0.16.7] — 2026-11-21
+
+- 第三轮设计/缺陷审计（2026-11-21）redisx 修复：
+
+- fix: distlock Unlock/Release 内部解耦取消 ctx（WithoutCancel+3s 有界）——已取消 ctx 下解锁不再失败致锁孤儿 5.5 分钟（#257）
+- fix: watchdog onLost/onGaveUp 退出时 CompareAndDelete 清理 lockState——高基数锁键不再永久残留 map（#257）
+- feat: WithOnLockLost / WithSemaphoreOnLockLost 回调——丢锁/放弃续期可编程感知（#257）
+- fix: Semaphore Cleanup olderThan<0 fail-fast——负 grace 不再清空全部活跃槽位（#257）
+- fix: cache 读路径把精确 "null" 视为 miss——滚动升级后旧版本写下的 nil 缓存不再零值伪命中（#258）
+
+关联问题单：redisx#257、redisx#258。
+
+## [v0.16.6] — 2026-11-20
+
+- fix(cache): RedisCache Set/SetWithTTL 对 nil 值 fail-fast——默认序列化把 nil 写成 json "null"、读路径无错 no-op 还原零值伪命中，与 LocalCache 跨后端分叉且违 cachetest 契约「序列化型实现须定义 nil 编码」（#247）
+fix(cache): 全部 11 个公开入口补 nil-ctx 兜底——pkg v0.55.1 cachetest 契约第 9 场景在地板 bump CI 暴露 nil ctx 直捅 go-redis pool（#252）
+docs(pipeline): 补「非事务语义」立约段——go-redis Pipeline 非 MULTI/EXEC、无回滚，真原子走 Lua（timertask #150/#157 先例传导）（#248）
+
+## [v0.16.5] — 2026-11-19
+
+- - refactor: ratelimit per-key 桶缓存两份逐字同构收敛——PeriodLimit.bucketFor 与 ResilientLimiter.localFor 下沉 bucketCache 单类型（sync.Map + build 闭包注入，含 once 单飞、nil 不缓存、清扫合一）；#166 时代修 singleflight 需双侧打补丁的漂移结构根除，既有 #125/#127/#166/#167 回归全绿（#242）
+
+关联问题单：redisx#242。
+
+## [v0.16.4] — 2026-11-18
+
+- distlock 锁 value 迁 stringx.RandomToken 单源、续期安全网迁 pkg/distlock.MaxLifetime(pkg v0.53.0 原语);行为不变(编码对拍一致)
+
+## [v0.16.3] — 2026-11-16
+
+- refactor: fmt.Errorf → oekit/pkg/errors 三形态对位替换（#520 替换波）+ 依赖地板抬至 pkg v0.52.0。文案逐字节同形（测试断言零修改），多 %w/%w 居中/哨兵前置形态按仓规保留
+
+## [v0.16.2] — 2026-11-15
+
+- fix: BruteForceGuard 补幂等 Close(ctx)（未触发降级 no-op、已构建关清扫 goroutine，Close 后 Fail/Check/Reset 返回 ErrGuardClosed 不再懒构建，#221）；Fail 增 FailWithResult 返回 FailResult{Count,Locked,NewlyLocked,Remain} 携带「本次刚触发」跃迁（Lua SET NX/PTTL 精确判定，16 并发恰好 1 个 NewlyLocked），旧 Fail 委托新方法签名行为不变（#222）
+
+关联问题单：redisx#221、redisx#222。
+
+## [v0.16.1] — 2026-11-15
+
+- 坏条目归一为 miss 回源自愈（#213）：反序列化失败/空字节不再硬报错，MGet 单键损坏不整批失败，GetOrLoad 可自愈
+- Pipeline 整批判定面（#214）：Exec godoc 明写 err 仅首条（cmdsFirstErr），新增 ExecChecked 用 errors.Join 聚合全部命令错误（redis.Nil 不计、传输级同错去重）
+- Refresh 无 Source 入口 fail-fast（#215）：删除前返回 error，不再先清缓存后永不回源；Del 错误上抛
+- Set expiration 语义成文（#216）：0=永久键不下发 EX、-1=KeepTTL、正值=TTL，与 cache 包口径差异点名
+- NewClientFromConfig 构造期校验地址（#217）：Host 非空、Port 1..65535，net.JoinHostPort 支持 IPv6，不再静默连本机回环
+
+关联问题单：redisx#213、redisx#214、redisx#215、redisx#216、redisx#217。
+
 ## [v0.16.0] — 2026-11-13
 
 - **BREAKING**：删除 Batch/NewBatch 旧类型（redisx#161 终局）——Batch 是 Pipeline 的功能子集旧类型（12 方法全为单行委托），前缀管道抽象收敛为 Pipeline/TxPipeline 单套。下游迁移：client.NewBatch() → client.Pipeline()（方法同构）。地板随迁 pkg v0.48.0 / logx v0.11.0 / concurrency v0.36.0。

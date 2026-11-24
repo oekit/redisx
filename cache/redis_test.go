@@ -82,17 +82,72 @@ func TestRedisCache_Get_NullValueMarker(t *testing.T) {
 	}
 }
 
-func TestRedisCache_Get_DeserializeError(t *testing.T) {
+// TestRedisCache_CorruptEntry_TreatedAsMiss 回归（#213）：非空但不可
+// 反序列化的损坏条目必须与空字节同口径按 miss 处理——此前硬报错会让
+// GetOrLoad 短路返回、Source 永不被调用，坏条目存活到 TTL（缺省 24h）
+// 期间所有读取全部失败且无自愈路径。
+func TestRedisCache_CorruptEntry_TreatedAsMiss(t *testing.T) {
 	client, mr := newTestRedisClient(t)
 	if err := mr.Set("x:bad", "not valid json"); err != nil {
 		t.Fatal(err)
 	}
-	c := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "x:"})
+	sourceCalls := 0
+	c := NewRedisCache[testUser](client, RedisConfig[testUser]{
+		Prefix: "x:",
+		TTL:    time.Minute,
+		Source: func(ctx context.Context, key string) (*testUser, error) {
+			sourceCalls++
+			return &testUser{ID: 9, Name: "healed"}, nil
+		},
+	})
 	ctx := context.Background()
 
-	_, err := c.Get(ctx, "bad")
-	if err == nil {
-		t.Error("expected deserialize error, got nil")
+	// 纯 Get：miss（非 error），与 key 不存在同口径
+	got, err := c.Get(ctx, "bad")
+	if err != nil {
+		t.Fatalf("损坏条目应按 miss 处理而非硬报错（#213），got err=%v", err)
+	}
+	if got != nil {
+		t.Fatalf("损坏条目 Get 应返回 nil, got %+v", got)
+	}
+
+	// GetOrLoad：回源 + 覆盖自愈（修复前 Source 永不被调用）
+	loaded, err := c.GetOrLoad(ctx, "bad")
+	if err != nil {
+		t.Fatalf("GetOrLoad: %v", err)
+	}
+	if sourceCalls != 1 {
+		t.Fatalf("损坏条目应回源自愈，Source 被调用 %d 次（修复前为 0）", sourceCalls)
+	}
+	if loaded == nil || loaded.Name != "healed" {
+		t.Fatalf("GetOrLoad 应返回 Source 值, got %+v", loaded)
+	}
+	// 自愈证明：坏条目已被回填的有效 JSON 覆盖，再次 Get 命中真值
+	got, err = c.Get(ctx, "bad")
+	if err != nil || got == nil || got.Name != "healed" {
+		t.Fatalf("回源覆盖后应命中有效值，got %+v err=%v", got, err)
+	}
+}
+
+// TestRedisCache_MGet_CorruptEntry_SkipsNotWholeBatchFail 回归（#213）：
+// MGet 遇到单个损坏条目不得整批硬失败——坏键缺席、其余命中键照常返回。
+func TestRedisCache_MGet_CorruptEntry_SkipsNotWholeBatchFail(t *testing.T) {
+	client, mr := newTestRedisClient(t)
+	c := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "x:", TTL: time.Minute})
+	if err := mr.Set("x:good", `{"ID":1,"Name":"alice"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := mr.Set("x:corrupt", "not valid json"); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	got, err := c.MGet(ctx, "good", "corrupt", "absent")
+	if err != nil {
+		t.Fatalf("MGet 不应因单个损坏条目整批报错（#213），got err=%v", err)
+	}
+	if len(got) != 1 || got["good"] == nil || got["good"].Name != "alice" {
+		t.Fatalf("MGet = %v, want 只含 good（corrupt/absent 缺席）", got)
 	}
 }
 
@@ -386,6 +441,69 @@ func TestRedisCache_Refresh(t *testing.T) {
 	}
 	if loadCount != 1 {
 		t.Errorf("expected 1 Source call after first refresh, got %d", loadCount)
+	}
+}
+
+// TestRedisCache_Refresh_NoSourceFailFast 回归（redisx#215 删除顺序）：
+// 未配置 Source 时 Refresh 必须在**Del 之前** fail-fast 返回 error——旧实现
+// 先删缓存再走 GetOrLoad（Source==nil 返回 (nil,nil)），调用方拿到「刷新完成、
+// 值为 nil」而缓存已被清空且永不回源（静默数据丢失）。钉住两件事：
+// ① 返回 error 而非 (nil, nil)；② 已有条目原样保留（Del 未执行）。
+func TestRedisCache_Refresh_NoSourceFailFast(t *testing.T) {
+	client, _ := newTestRedisClient(t)
+	// 纯缓存用法：只配 Prefix/TTL，不配 Source（Set/Get 完全合法）
+	c := NewRedisCache[testUser](client, RedisConfig[testUser]{
+		Prefix: "x:",
+		TTL:    time.Minute,
+	})
+	ctx := context.Background()
+
+	if err := c.Set(ctx, "k", &testUser{ID: 1, Name: "v1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.Refresh(ctx, "k")
+	if err == nil {
+		t.Fatal("未配置 Source 的 Refresh 必须返回 error（fail-fast），不得返回 (nil, nil)")
+	}
+	if got != nil {
+		t.Errorf("失败路径不应返回值，got %+v", got)
+	}
+	// 对照：条目必须还在——修复前此处已被 Del 清空
+	v, gerr := c.Get(ctx, "k")
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if v == nil || v.ID != 1 {
+		t.Errorf("fail-fast 不得先删缓存（#215 删除顺序），条目应原样保留，got %+v", v)
+	}
+}
+
+// TestRedisCache_Refresh_DelErrorPropagates 回归（redisx#215）：Del 失败必须
+// 上抛而非只记日志——旧实现 log 后继续 GetOrLoad，读到旧值时旧值冒充刷新结果
+// 返回（错误面断裂）。钉住：返回 error、不返回旧值。
+func TestRedisCache_Refresh_DelErrorPropagates(t *testing.T) {
+	client, mr := newTestRedisClient(t)
+	c := NewRedisCache[testUser](client, RedisConfig[testUser]{
+		Prefix: "x:",
+		TTL:    time.Minute,
+		Source: func(ctx context.Context, key string) (*testUser, error) {
+			return &testUser{ID: 42, Name: "src"}, nil
+		},
+	})
+	ctx := context.Background()
+	if err := c.Set(ctx, "k", &testUser{ID: 1, Name: "old"}); err != nil {
+		t.Fatal(err)
+	}
+
+	mr.Close() // 服务端关闭 → Del 必失败
+
+	got, err := c.Refresh(ctx, "k")
+	if err == nil {
+		t.Fatal("Del 失败必须上抛（修复前只 log 后继续）")
+	}
+	if got != nil {
+		t.Errorf("Del 失败不得返回值（旧值冒充刷新结果），got %+v", got)
 	}
 }
 
@@ -899,5 +1017,95 @@ func TestRedisCache_SetRaw_PositiveTTLHasExpiry(t *testing.T) {
 	ttl := mr.TTL("x:k")
 	if ttl <= 0 {
 		t.Fatalf("positive TTL write must carry an expiry, got %s", ttl)
+	}
+}
+
+// TestRedisCache_Set_NilValueGuardAgainstNullPseudoHit 回归测试（#247）：
+// Set(nil) 必须 fail-fast 返回错误、绝不落键——旧实现经默认 JSON 序列化把
+// nil 指针写成字节 "null"，Get 读路径既不认 nullValue 哨兵、
+// json.Unmarshal("null", &result) 又是无错 no-op，返回 &T{} 零值伪命中；
+// 同操作的 LocalCache 返回 (nil, nil)，同一 cache.Cache[T] 接口跨后端分叉
+// （cachetest RunHitWithClock 前提：序列化型实现须定义 nil 值的编码）。
+func TestRedisCache_Set_NilValueGuardAgainstNullPseudoHit(t *testing.T) {
+	client, mr := newTestRedisClient(t)
+	rc := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "x:"})
+	ctx := context.Background()
+
+	err := rc.Set(ctx, "k", nil)
+	if err == nil {
+		t.Fatal("Set(nil) 必须返回错误（#247）")
+	}
+	if !strings.Contains(err.Error(), "nil") {
+		t.Fatalf("错误信息必须指明 value 为 nil，got: %v", err)
+	}
+	// 关键反断言：报错路径不得落键——旧实现落 "null" 字节键，被 Get 读成零值伪命中。
+	if mr.Exists("x:k") {
+		t.Fatal(`Set(nil) 报错后不得落键（旧实现写 "null" 字节，#247）`)
+	}
+}
+
+// TestRedisCache_SetWithTTL_NilValueGuard 回归测试（#247）：SetWithTTL 的
+// 自定义 TTL 入口不豁免 nil 值契约——与 Set 同口径 fail-fast，报错、绝不落键。
+func TestRedisCache_SetWithTTL_NilValueGuard(t *testing.T) {
+	client, mr := newTestRedisClient(t)
+	rc := NewRedisCache[testUser](client, RedisConfig[testUser]{Prefix: "x:"})
+	ctx := context.Background()
+
+	err := rc.SetWithTTL(ctx, "k", nil, time.Minute)
+	if err == nil {
+		t.Fatal("SetWithTTL(nil) 必须返回错误（#247）")
+	}
+	if !strings.Contains(err.Error(), "nil") {
+		t.Fatalf("错误信息必须指明 value 为 nil，got: %v", err)
+	}
+	if mr.Exists("x:k") {
+		t.Fatal("SetWithTTL(nil) 报错后不得落键（#247）")
+	}
+}
+
+// TestRedisCache_GetOrLoad_NilSource_WritesSentinelNotSet 钉住 GetOrLoad 对
+// nil Source 结果直写 nullValue 哨兵（#247）：不经 Set 回填（Set 对 nil
+// fail-fast，直通会炸），落库字节恰为哨兵；读侧按 null marker 口径返回
+// (nil, nil) 而非零值伪命中，且防穿透短路生效。
+func TestRedisCache_GetOrLoad_NilSource_WritesSentinelNotSet(t *testing.T) {
+	client, mr := newTestRedisClient(t)
+	var sourceCalls int
+	rc := NewRedisCache[testUser](client, RedisConfig[testUser]{
+		Prefix: "x:",
+		Source: func(ctx context.Context, key string) (*testUser, error) {
+			sourceCalls++
+			return nil, nil
+		},
+	})
+	ctx := context.Background()
+
+	got, err := rc.GetOrLoad(ctx, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("nil Source 结果必须返回 (nil, nil)，got %+v", got)
+	}
+	// 落库字节恰为 nullValue 哨兵（证明走的是哨兵直写而非 Set 的 JSON 序列化）。
+	raw, err := client.Get(ctx, "x:k").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw != nullValue {
+		t.Fatalf("GetOrLoad 对 nil Source 结果必须直写 nullValue 哨兵（#247），got %q", raw)
+	}
+	// 读侧口径：Get 返回 (nil, nil)，GetOrLoad 命中 marker 不再回源（防穿透）。
+	g, err := rc.Get(ctx, "k")
+	if err != nil || g != nil {
+		t.Fatalf("Get(null marker) 应返回 (nil, nil)，got (%+v, %v)", g, err)
+	}
+	if _, err := rc.GetOrLoad(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	if sourceCalls != 1 {
+		t.Fatalf("null marker 防穿透：Source 应只调 1 次，got %d", sourceCalls)
+	}
+	if !mr.Exists("x:k") {
+		t.Fatal("第二次 GetOrLoad 后 null marker 应仍在（防穿透短路，#247）")
 	}
 }

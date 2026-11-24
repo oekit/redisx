@@ -39,6 +39,10 @@
 //   - 可选 per-instance 日志注入（WithLogger / WithSemaphoreLogger，#120）：
 //     watchdog 告警只进注入的 logger；缺省实例私有的 logx.Delegating("distlock")，
 //     与历史行为一致
+//   - 可选锁/槽丢失回调（WithOnLockLost / WithSemaphoreOnLockLost，#257）：
+//     自动续期发现锁已丢失或达最大生命周期放弃续期时同步触发，应用可立即
+//     取消长临界区工作/健康检查转 red（丢锁后继续执行即静默脑裂）；watchdog
+//     退出时以 CompareAndDelete 清理内部状态表，不再无界残留
 //   - 支持 redis.UniversalClient（兼容单机、集群、哨兵模式）；Lockout
 //     三键共享 hash-tag，集群上 Lua 多键访问合法（#119）
 //
@@ -109,7 +113,7 @@
 //
 //	ownerID, err := locker.Lock(ctx, "deploy:"+env, 5*time.Minute, 10*time.Minute)
 //	if err != nil {
-//	    return fmt.Errorf("获取部署锁失败: %w", err)
+//	    return errors.Wrapf(err, "获取部署锁失败")
 //	}
 //	defer locker.Unlock(ctx, "deploy:"+env, ownerID)
 //	return runDeploy(env)
@@ -172,6 +176,7 @@
 //	    LockTTL:     15 * time.Minute,
 //	    MemFallback: true, // Redis 故障降级到进程内 Lockout（单实例有界）
 //	})
+//	defer guard.Close(ctx) // 释放惰性构建的降级层后台清扫 goroutine（#221）
 //	if locked, _ := guard.Check(ctx, "user:42"); locked {
 //	    return ErrTooManyAttempts // 429，余量经 guard.Check 查询
 //	}

@@ -2,11 +2,12 @@ package distlock
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
 	"github.com/oekit/logx"
+	pkgdistlock "github.com/oekit/pkg/distlock"
+	"github.com/oekit/pkg/errors"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -90,6 +91,9 @@ type Semaphore struct {
 	// log 是 per-instance 日志（与 RedisLocker 的 WithLogger 同形）：watchdog
 	// 告警只进该 logger，缺省为实例私有的 logx.Delegating("distlock")。
 	log logx.Logger
+	// onSlotLost 是自动续期丢失槽位/放弃续期的回调（#257，选项
+	// WithSemaphoreOnLockLost）：watchdog goroutine 内同步触发。
+	onSlotLost func(identifier string)
 	// sessions 是自动续期运行态：identifier → *lockState（复用 RedisLocker
 	// 的续期状态机形态，identifier 对位 ownerID）。
 	sessions sync.Map
@@ -145,6 +149,20 @@ func WithSemaphoreLogger(lg logx.Logger) SemaphoreOption {
 	}
 }
 
+// WithSemaphoreOnLockLost 设置槽位丢失回调（#257）：仅在启用
+// [WithSemaphoreAutoRenew] 时生效。语义与 RedisLocker 的 WithOnLockLost 同形：
+//
+//   - 续期返回 (false, nil)：槽位已过期回收/被 Release/配额被他人接管；
+//   - 达到 [WithSemaphoreMaxAutoRenew] 最大生命周期主动放弃续期——槽位会在
+//     slotTTL 后自然回收，调用方同样不得再假设自己占着配额。
+//
+// identifier 为 Acquire 时提供的持有者身份。回调在 watchdog goroutine 内
+// **同步**执行，必须快速返回且不得阻塞。用途：长任务中途丢槽后立即停止
+// 工作并重新 Acquire/放弃任务——继续执行会突破全局并发上限。
+func WithSemaphoreOnLockLost(fn func(identifier string)) SemaphoreOption {
+	return func(s *Semaphore) { s.onSlotLost = fn }
+}
+
 // NewSemaphore 创建分布式信号量。key 为完整 Redis key（ZSET），
 // max 为最大并发持有者数，slotTTL 为单次占槽的有效期。
 // max/slotTTL 非法时在使用时报错（与 distlock 其余入口的 fail-fast 口径一致）。
@@ -174,13 +192,13 @@ func (s *Semaphore) logr() logx.Logger {
 // validate 构造参数与运行条件的统一 fail-fast 校验。
 func (s *Semaphore) validate() error {
 	if s.client == nil {
-		return fmt.Errorf("distlock: semaphore requires a non-nil redis client (no graceful degradation for quota semantics)")
+		return errors.New("distlock: semaphore requires a non-nil redis client (no graceful degradation for quota semantics)")
 	}
 	if s.max <= 0 {
-		return fmt.Errorf("distlock: semaphore max must be positive, got %d", s.max)
+		return errors.Newf("distlock: semaphore max must be positive, got %d", s.max)
 	}
 	if s.slotTTL <= 0 {
-		return fmt.Errorf("distlock: semaphore slotTTL must be positive, got %v", s.slotTTL)
+		return errors.Newf("distlock: semaphore slotTTL must be positive, got %v", s.slotTTL)
 	}
 	return nil
 }
@@ -193,7 +211,7 @@ func (s *Semaphore) validate() error {
 // （同一 identifier 重复 Acquire 会重启 watchdog，旧 goroutine 被安全停掉）。
 func (s *Semaphore) Acquire(ctx context.Context, identifier string) (bool, error) {
 	if identifier == "" {
-		return false, fmt.Errorf("distlock: semaphore identifier must not be empty")
+		return false, errors.New("distlock: semaphore identifier must not be empty")
 	}
 	if err := s.validate(); err != nil {
 		return false, err
@@ -202,7 +220,7 @@ func (s *Semaphore) Acquire(ctx context.Context, identifier string) (bool, error
 	ok, err := semaphoreAcquireScript.Run(ctx, s.client, []string{s.key},
 		identifier, now.UnixMilli(), now.Add(s.slotTTL).UnixMilli(), s.max).Int()
 	if err != nil {
-		return false, fmt.Errorf("redis semaphore acquire failed: %w", err)
+		return false, errors.Wrapf(err, "redis semaphore acquire failed")
 	}
 	if ok == 1 && s.autoRenew {
 		s.startAutoRenew(identifier)
@@ -216,7 +234,7 @@ func (s *Semaphore) Acquire(ctx context.Context, identifier string) (bool, error
 // error 表示 Redis 通信故障，可重试。
 func (s *Semaphore) Renew(ctx context.Context, identifier string) (bool, error) {
 	if identifier == "" {
-		return false, fmt.Errorf("distlock: semaphore identifier must not be empty")
+		return false, errors.New("distlock: semaphore identifier must not be empty")
 	}
 	if err := s.validate(); err != nil {
 		return false, err
@@ -225,7 +243,7 @@ func (s *Semaphore) Renew(ctx context.Context, identifier string) (bool, error) 
 	ok, err := semaphoreRenewScript.Run(ctx, s.client, []string{s.key},
 		identifier, now.UnixMilli(), now.Add(s.slotTTL).UnixMilli()).Int()
 	if err != nil {
-		return false, fmt.Errorf("redis semaphore renew failed: %w", err)
+		return false, errors.Wrapf(err, "redis semaphore renew failed")
 	}
 	return ok == 1, nil
 }
@@ -237,16 +255,22 @@ func (s *Semaphore) Renew(ctx context.Context, identifier string) (bool, error) 
 // 与自动续期 watchdog 的时序（#126，对齐 Locker.Unlock 的 #115 口径）：
 // 释放（网络）先行、watchdog 后停——释放结果明确（nil，含幂等未持有）才停；
 // 通信故障时 watchdog 继续续期兜底（槽位可能仍在），调用方可重试 Release。
+//
+// ctx 解耦（#257，与 Unlock 同口径对齐 pkg/distlock.ReleaseUncancelable）：
+// 调用方 ctx 已取消时仍必须把 ZREM 发出去，否则槽位孤儿到 slotTTL 过期；
+// WithoutCancel 剥离取消信号 + releaseTimeout 有界上界。
 func (s *Semaphore) Release(ctx context.Context, identifier string) error {
 	if identifier == "" {
-		return fmt.Errorf("distlock: semaphore identifier must not be empty")
+		return errors.New("distlock: semaphore identifier must not be empty")
 	}
 	if err := s.validate(); err != nil {
 		return err
 	}
-	_, err := semaphoreReleaseScript.Run(ctx, s.client, []string{s.key}, identifier).Result()
+	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+	_, err := semaphoreReleaseScript.Run(uctx, s.client, []string{s.key}, identifier).Result()
 	if err != nil {
-		return fmt.Errorf("redis semaphore release failed: %w", err)
+		return errors.Wrapf(err, "redis semaphore release failed")
 	}
 	s.stopAutoRenew(identifier)
 	return nil
@@ -255,16 +279,25 @@ func (s *Semaphore) Release(ctx context.Context, identifier string) error {
 // Cleanup 清理「已过期超过 olderThan」的槽，返回清理条数。
 // olderThan=0 清理所有已过期槽；olderThan>0 留出宽限，只清过期时间
 // 早于 now-olderThan 的（巡检时避免干扰刚到期的边界槽）。
+//
+// olderThan 必须 >= 0（#257 fail-fast，与 SetWithTTL/ttl<=0 的零值笔误
+// 护栏同口径）：负值时 threshold = now+|olderThan| 落在未来，
+// ZREMRANGEBYSCORE -inf <未来> 会删除**全部**槽位（含活跃持有者）——
+// 无告警清空配额、后续 Acquire 突破 max。负宽限没有合法语义，响亮拒绝。
+//
 // 日常路径无需显式调用——Acquire 内部已原子清理；本方法面向运维巡检
 // 与配额占用指标观测。
 func (s *Semaphore) Cleanup(ctx context.Context, olderThan time.Duration) (int64, error) {
 	if err := s.validate(); err != nil {
 		return 0, err
 	}
+	if olderThan < 0 {
+		return 0, errors.Newf("distlock: semaphore Cleanup olderThan must be non-negative, got %v (negative threshold would delete live slots)", olderThan)
+	}
 	threshold := s.now().Add(-olderThan).UnixMilli()
 	n, err := semaphoreCleanupScript.Run(ctx, s.client, []string{s.key}, threshold).Int64()
 	if err != nil {
-		return 0, fmt.Errorf("redis semaphore cleanup failed: %w", err)
+		return 0, errors.Wrapf(err, "redis semaphore cleanup failed")
 	}
 	return n, nil
 }
@@ -284,7 +317,8 @@ func (s *Semaphore) Cleanup(ctx context.Context, olderThan time.Duration) (int64
 func (s *Semaphore) startAutoRenew(identifier string) {
 	w := newRenewWatchdog(&s.sessions, identifier, identifier)
 	w.interval = renewIntervalFrom(s.renewInterval, s.slotTTL)
-	w.maxLifetime = renewMaxLifetime(s.maxAutoRenew, s.slotTTL)
+	// 三态口径单源:pkg/distlock.MaxLifetime(0→10×ttl、负→0 不限、正→显式)。
+	w.maxLifetime = pkgdistlock.MaxLifetime(s.maxAutoRenew, s.slotTTL)
 	w.renew = func(ctx context.Context) (bool, error) {
 		return s.Renew(ctx, identifier)
 	}
@@ -298,10 +332,16 @@ func (s *Semaphore) startAutoRenew(identifier string) {
 		// 应重新 Acquire。
 		s.logr().Warn("auto renew failed: semaphore slot lost or recycled",
 			"key", s.key, "identifier", identifier)
+		if s.onSlotLost != nil {
+			s.onSlotLost(identifier)
+		}
 	}
 	w.onGaveUp = func(maxLifetime time.Duration) {
 		s.logr().Warn("auto renew exceeded max lifetime, giving up slot",
 			"key", s.key, "identifier", identifier, "max_lifetime", maxLifetime)
+		if s.onSlotLost != nil {
+			s.onSlotLost(identifier)
+		}
 	}
 	w.startAutoRenew()
 }

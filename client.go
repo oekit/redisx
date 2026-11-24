@@ -2,10 +2,10 @@ package redisx
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
+	"github.com/oekit/pkg/errors"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -55,7 +55,7 @@ func WithPrefix(prefix string) RedisClientOptionFunc {
 //	_ = redisotel.InstrumentTracing(c.Client()) // github.com/oekit/tracing/redisotel
 func NewClient(opt *redis.UniversalOptions, opts ...RedisClientOptionFunc) (*Client, error) {
 	if opt == nil {
-		return nil, fmt.Errorf("redisx: options are nil")
+		return nil, errors.New("redisx: options are nil")
 	}
 
 	o := &RedisClientOption{}

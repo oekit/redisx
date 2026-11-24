@@ -235,7 +235,7 @@ func TestPeriodLimit_RescueBoundedLocal_BucketsClearedOnRecover(t *testing.T) {
 	if code, err := l.Take(ctx, "user:1"); err != nil || code != Allowed {
 		t.Fatalf("degraded take = (%d, %v), want (Allowed, nil)", code, err)
 	}
-	if _, ok := l.buckets.Load("user:1"); !ok {
+	if _, ok := l.buckets.m.Load("user:1"); !ok {
 		t.Fatal("expected bucket to be cached during outage")
 	}
 
@@ -312,9 +312,9 @@ func TestResilientLimiter_LocalCacheClearedAfterRedisRecovery(t *testing.T) {
 }
 
 // countBuckets 统计降级桶缓存条目数（测试断言用）。
-func countBuckets(m *sync.Map) int {
+func countBuckets(c *bucketCache) int {
 	n := 0
-	m.Range(func(any, any) bool {
+	c.m.Range(func(any, any) bool {
 		n++
 		return true
 	})
